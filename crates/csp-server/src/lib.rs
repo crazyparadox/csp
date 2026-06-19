@@ -353,9 +353,71 @@ fn parse_params<T: serde::de::DeserializeOwned>(req: &Request) -> Option<T> {
         .and_then(|p| serde_json::from_value(p).ok())
 }
 
-/// Map a `file://` URI to a filesystem path.
+/// Map a `file://` URI to a filesystem path, percent-decoding the path so URIs
+/// produced by conformant clients (e.g. VS Code) round-trip — a path with a
+/// space arrives as `%20` and must be decoded before it names a real file.
+/// Accepts the empty-authority (`file:///p`), `localhost`, and no-authority
+/// (`file:/p`) forms.
 fn uri_to_path(uri: &str) -> Option<PathBuf> {
-    uri.strip_prefix("file://").map(PathBuf::from)
+    let rest = uri
+        .strip_prefix("file://localhost/")
+        .map(|r| format!("/{r}"))
+        .or_else(|| uri.strip_prefix("file://").map(str::to_string))
+        .or_else(|| uri.strip_prefix("file:").map(str::to_string))?;
+    Some(PathBuf::from(normalize_uri_path(&percent_decode(&rest))))
+}
+
+/// On Windows, turn a URI path (`/C:/dir/f`, forward slashes, leading slash
+/// before the drive) into a native path (`C:\dir\f`).
+#[cfg(windows)]
+fn normalize_uri_path(p: &str) -> String {
+    let bytes = p.as_bytes();
+    let trimmed = if bytes.len() >= 3
+        && bytes[0] == b'/'
+        && bytes[1].is_ascii_alphabetic()
+        && bytes[2] == b':'
+    {
+        &p[1..]
+    } else {
+        p
+    };
+    trimmed.replace('/', "\\")
+}
+
+#[cfg(not(windows))]
+fn normalize_uri_path(p: &str) -> String {
+    p.to_string()
+}
+
+/// Decode `%XX` escapes back into bytes, then interpret as UTF-8. Invalid or
+/// truncated escapes are passed through verbatim (best-effort, never panics).
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(hi), Some(lo)) =
+                (hex_val(bytes[i + 1]), hex_val(bytes[i + 2]))
+            {
+                out.push(hi << 4 | lo);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn hex_val(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -531,6 +593,33 @@ mod tests {
         let msgs = drain(&buf);
         let resp = msgs.iter().find(|m| m["id"] == 2).expect("coverage response");
         assert_eq!(resp["result"]["coverage"]["summary"]["linesTotal"], 2);
+    }
+
+    #[test]
+    fn uri_to_path_percent_decodes() {
+        assert_eq!(
+            uri_to_path("file:///tmp/csp%20space/go.mod"),
+            Some(PathBuf::from("/tmp/csp space/go.mod"))
+        );
+        // Non-ASCII: 'é' = %C3%A9 in UTF-8.
+        assert_eq!(
+            uri_to_path("file:///caf%C3%A9/x.rs"),
+            Some(PathBuf::from("/café/x.rs"))
+        );
+        // Plain paths are unchanged.
+        assert_eq!(
+            uri_to_path("file:///a/b/c.rs"),
+            Some(PathBuf::from("/a/b/c.rs"))
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn uri_to_path_windows_drive_letter() {
+        assert_eq!(
+            uri_to_path("file:///C:/proj/a%20b.rs"),
+            Some(PathBuf::from("C:\\proj\\a b.rs"))
+        );
     }
 
     #[test]

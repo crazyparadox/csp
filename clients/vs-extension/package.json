@@ -1,0 +1,87 @@
+{
+  "name": "csp-coverage",
+  "displayName": "CSP Coverage",
+  "description": "Render test coverage in the gutter from any Coverage Server Protocol (CSP) server.",
+  "version": "0.1.0",
+  "publisher": "csp",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/decentparadox/csp.git",
+    "directory": "examples/csp-extension"
+  },
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Testing",
+    "Visualization"
+  ],
+  "main": "./out/extension.js",
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "contributes": {
+    "commands": [
+      {
+        "command": "csp.restart",
+        "title": "CSP: Restart Coverage Server"
+      },
+      {
+        "command": "csp.toggleGutters",
+        "title": "CSP: Toggle Coverage Gutters"
+      },
+      {
+        "command": "csp.showLog",
+        "title": "CSP: Show Server Log"
+      }
+    ],
+    "configuration": {
+      "title": "CSP Coverage",
+      "properties": {
+        "csp.serverPath": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Path to the `csp-server` binary. If empty, the extension looks for a built binary under the workspace's `target/{release,debug}` and the CSP repo, then falls back to `csp-server` on `PATH`."
+        },
+        "csp.framework": {
+          "type": "string",
+          "enum": [
+            "auto",
+            "cargo-llvm-cov",
+            "go",
+            "istanbul",
+            "lcov"
+          ],
+          "default": "auto",
+          "description": "Force a coverage adapter. 'auto' lets the server detect it from the project."
+        },
+        "csp.enableGutters": {
+          "type": "boolean",
+          "default": true,
+          "description": "Render covered/uncovered lines in the editor gutter."
+        },
+        "csp.noAutorun": {
+          "type": "boolean",
+          "default": false,
+          "markdownDescription": "Set `CSP_NO_AUTORUN` so the server only reports an existing coverage artifact instead of running the project's coverage tool itself."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run build",
+    "build": "node esbuild.js",
+    "watch": "node esbuild.js --watch",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "vscode-jsonrpc": "^8.2.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "@types/vscode": "^1.85.0",
+    "esbuild": "^0.20.0",
+    "typescript": "^5.3.0"
+  }
+}

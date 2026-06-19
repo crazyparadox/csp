@@ -117,9 +117,14 @@ pub fn select(root: &Path, hint: Option<&str>) -> Option<Box<dyn CoverageAdapter
     registry().into_iter().find(|a| a.detect(root))
 }
 
-/// Convert a filesystem path to a `file://` URI, making it absolute against
-/// `root` when relative. Best-effort: falls back to the lexical join when the
-/// path does not exist on disk (e.g. coverage for a deleted file).
+/// Convert a filesystem path to an RFC 3986 `file://` URI, making it absolute
+/// against `root` when relative. Best-effort: falls back to the lexical join when
+/// the path does not exist on disk (e.g. coverage for a deleted file).
+///
+/// The path is percent-encoded so the result is a conformant URI that a strict
+/// client (e.g. VS Code's `Uri.parse`) decodes back to the original path. Paths
+/// containing spaces or other reserved characters would otherwise produce
+/// malformed URIs that no client could match against an open document.
 pub fn path_to_uri(root: &Path, path: &str) -> String {
     let p = Path::new(path);
     let abs: PathBuf = if p.is_absolute() {
@@ -127,6 +132,124 @@ pub fn path_to_uri(root: &Path, path: &str) -> String {
     } else {
         root.join(p)
     };
-    let abs = abs.canonicalize().unwrap_or(abs);
-    format!("file://{}", abs.to_string_lossy())
+    // Normalise `.`/`..` lexically rather than calling `canonicalize`: resolving
+    // symlinks would yield a real path (e.g. `/tmp` → `/private/tmp` on macOS)
+    // that no longer matches the URI the editor sends for the same open file.
+    let abs = lexically_normalize(&abs);
+    format!("file://{}", percent_encode_path(&to_uri_path(&abs)))
+}
+
+/// Resolve `.` and `..` components without touching the filesystem.
+fn lexically_normalize(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for comp in path.components() {
+        match comp {
+            Component::ParentDir => {
+                out.pop();
+            }
+            Component::CurDir => {}
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+/// Render an absolute path as the path portion of a `file://` URI. On Windows
+/// this maps `C:\dir\f` to `/C:/dir/f` (forward slashes, leading slash before
+/// the drive) so the result is a conformant `file:///C:/dir/f`.
+#[cfg(windows)]
+fn to_uri_path(abs: &Path) -> String {
+    let forward = abs.to_string_lossy().replace('\\', "/");
+    if forward.starts_with('/') {
+        forward
+    } else {
+        format!("/{forward}")
+    }
+}
+
+#[cfg(not(windows))]
+fn to_uri_path(abs: &Path) -> String {
+    abs.to_string_lossy().into_owned()
+}
+
+/// Percent-encode a filesystem path for use in a `file://` URI. Path separators
+/// (`/`) and the RFC 3986 unreserved set (`A-Z a-z 0-9 - . _ ~`) are preserved;
+/// every other byte is encoded as `%XX`. Encoding the UTF-8 bytes keeps non-ASCII
+/// paths valid.
+fn percent_encode_path(path: &str) -> String {
+    let mut out = String::with_capacity(path.len());
+    for &byte in path.as_bytes() {
+        match byte {
+            // Unreserved set, plus `/` (separator) and `:` (Windows drive colon;
+            // valid in a URI path and kept unencoded by VS Code).
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b'/' | b':' => {
+                out.push(byte as char);
+            }
+            _ => {
+                out.push('%');
+                out.push(hex_digit(byte >> 4));
+                out.push(hex_digit(byte & 0x0f));
+            }
+        }
+    }
+    out
+}
+
+fn hex_digit(nibble: u8) -> char {
+    match nibble {
+        0..=9 => (b'0' + nibble) as char,
+        _ => (b'A' + (nibble - 10)) as char,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn percent_encode_preserves_separators_and_unreserved() {
+        assert_eq!(
+            percent_encode_path("/Users/me/proj/src/math.rs"),
+            "/Users/me/proj/src/math.rs"
+        );
+    }
+
+    #[test]
+    fn percent_encode_escapes_spaces_and_reserved() {
+        assert_eq!(
+            percent_encode_path("/a b/c#d?/e.rs"),
+            "/a%20b/c%23d%3F/e.rs"
+        );
+    }
+
+    #[test]
+    fn percent_encode_escapes_non_ascii_as_utf8_bytes() {
+        // "café" → 'é' is U+00E9 = 0xC3 0xA9 in UTF-8.
+        assert_eq!(percent_encode_path("/caf\u{e9}"), "/caf%C3%A9");
+    }
+
+    #[test]
+    fn lexically_normalize_resolves_dot_segments() {
+        assert_eq!(
+            lexically_normalize(Path::new("/a/b/../c/./d")),
+            PathBuf::from("/a/c/d")
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn path_to_uri_windows_drive_letter() {
+        let uri = path_to_uri(Path::new("C:\\proj"), "src\\a b.rs");
+        assert_eq!(uri, "file:///C:/proj/src/a%20b.rs");
+    }
+
+    #[test]
+    fn path_to_uri_encodes_relative_path_under_root() {
+        // Use a non-existent root so canonicalize is a no-op and the result is
+        // the deterministic lexical join.
+        let root = Path::new("/no/such/root dir");
+        let uri = path_to_uri(root, "a b.rs");
+        assert_eq!(uri, "file:///no/such/root%20dir/a%20b.rs");
+    }
 }

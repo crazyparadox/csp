@@ -45,6 +45,14 @@ The one deliberate divergence: CSP enums serialize as **lower-case strings**
 JSON. `DiagnosticSeverity` maps 1:1 to LSP: `error→1`, `warning→2`,
 `information→3`, `hint→4`.
 
+### 1.1 Document URIs
+
+Every `uri` on the wire is an RFC 3986 `file://` URI with the path **percent-encoded**
+(`A-Z a-z 0-9 - . _ ~` and `/` preserved, every other byte escaped as `%XX` over
+its UTF-8 bytes) — identical to how LSP and VS Code emit `DocumentUri`. A client
+**must** compare URIs by their decoded filesystem path, not by raw string equality,
+because a server may normalise paths (e.g. resolve symlinks) before encoding them.
+
 ---
 
 ## 2. Transport
@@ -193,6 +201,12 @@ Params: [`run_state_changed_params.json`](./schema/run_state_changed_params.json
 — `{ runId, state, summary? }` where `state` is `running` / `finished` /
 `errored`. A client typically shows a spinner on `running` and a workspace
 coverage badge from the `summary` on `finished`.
+
+`finished` is the run's completion barrier: the server **must** have emitted every
+`csp/publishCoverage` (and `csp/publishTestResults` / `csp/publishQualityDiagnostics`)
+for `runId` before sending `finished`. A client may therefore treat `finished` as
+"all results for this run have arrived" — e.g. to clear coverage for files the run
+did not report on, or to drop a loading state.
 
 ---
 
