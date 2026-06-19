@@ -615,6 +615,135 @@ impl CoverageAdapter for GenericLcovAdapter {
     }
 }
 
+// --- Configured (from `.csp.toml`): run a user-specified command ---
+
+/// Runs the exact command a project's `.csp.toml` specifies, then parses the
+/// artifact it writes. This is the escape hatch for repos where auto-detection
+/// runs too much — e.g. scoping a monorepo to one crate so the instrumented
+/// build actually succeeds.
+pub struct ConfiguredAdapter {
+    command: Vec<String>,
+    artifact: String,
+    autorun: bool,
+}
+
+impl ConfiguredAdapter {
+    pub fn new(command: Vec<String>, artifact: String, autorun: bool) -> Self {
+        Self {
+            command,
+            artifact,
+            autorun,
+        }
+    }
+
+    fn artifact_path(&self, root: &Path) -> PathBuf {
+        root.join(&self.artifact)
+    }
+}
+
+impl CoverageAdapter for ConfiguredAdapter {
+    fn name(&self) -> &'static str {
+        "configured"
+    }
+
+    fn detect(&self, _root: &Path) -> bool {
+        true
+    }
+
+    fn capabilities(&self) -> ServerCapabilities {
+        ServerCapabilities {
+            test_results: true,
+            ..full_caps()
+        }
+    }
+
+    fn generate(&self, root: &Path) -> anyhow::Result<()> {
+        let (program, args) = self
+            .command
+            .split_first()
+            .context("`.csp.toml` command is empty")?;
+        let mut cmd = Command::new(program);
+        cmd.args(args).current_dir(root);
+
+        // If the configured command drives cargo-llvm-cov, supply the LLVM tools
+        // the same way the Rust adapter does (non-rustup toolchains lack them).
+        if self.command.iter().any(|a| a == "llvm-cov")
+            && (std::env::var_os("LLVM_COV").is_none() || std::env::var_os("LLVM_PROFDATA").is_none())
+        {
+            if let Some((llvm_cov, llvm_profdata)) = find_llvm_tools() {
+                cmd.env("LLVM_COV", llvm_cov).env("LLVM_PROFDATA", llvm_profdata);
+            }
+        }
+
+        let output = cmd
+            .output()
+            .with_context(|| format!("could not run `{program}` (is it installed and on PATH?)"))?;
+
+        // Best-effort test results from libtest-style stdout.
+        let results = parse_cargo_test_output(&String::from_utf8_lossy(&output.stdout), &String::new());
+        if !results.is_empty() {
+            if let Ok(json) = serde_json::to_vec(&results) {
+                let _ = std::fs::write(root.join(TEST_RESULTS_SIDECAR), json);
+            }
+        }
+
+        // Trust the artifact over the exit code (failing tests still emit it).
+        if !output.status.success() && !self.artifact_path(root).exists() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            anyhow::bail!(
+                "`{}` failed: {}",
+                self.command.join(" "),
+                [stdout.trim(), stderr.trim()]
+                    .iter()
+                    .filter(|s| !s.is_empty())
+                    .last()
+                    .copied()
+                    .unwrap_or("(no output)")
+            );
+        }
+        Ok(())
+    }
+
+    fn collect(&self, root: &Path, run_id: &RunId) -> anyhow::Result<RunData> {
+        let artifact = self.artifact_path(root);
+        let need_gen = !(artifact.exists() && artifact_is_fresh(&artifact, root));
+        let gen_err = if need_gen && self.autorun && autorun_enabled() {
+            self.generate(root).err()
+        } else {
+            None
+        };
+        if !artifact.exists() {
+            return Err(gen_err.unwrap_or_else(|| {
+                anyhow::anyhow!("no coverage artifact at {}", artifact.display())
+            }));
+        }
+        let content = std::fs::read_to_string(&artifact)
+            .with_context(|| format!("reading {}", artifact.display()))?;
+        let coverage = parse_artifact(&content, &self.artifact, root, run_id)?;
+        let mut data = RunData::from_coverage(run_id.clone(), coverage);
+        data.results = read_test_results(root, run_id);
+        Ok(data)
+    }
+}
+
+/// Parse a coverage artifact by its file extension: `.json` → Istanbul,
+/// `.out`/`.txt` → Go profile, anything else → LCOV.
+fn parse_artifact(
+    content: &str,
+    name: &str,
+    root: &Path,
+    run_id: &RunId,
+) -> anyhow::Result<Vec<csp_core::coverage::FileCoverage>> {
+    if name.ends_with(".json") {
+        istanbul::parse(content, root, run_id)
+    } else if name.ends_with(".out") || name.ends_with(".txt") {
+        Ok(go::parse(content, root, run_id))
+    } else {
+        Ok(lcov::parse(content, root, run_id))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -623,6 +752,24 @@ mod tests {
     fn set_mtime(path: &Path, secs: u64) {
         let f = std::fs::OpenOptions::new().write(true).open(path).unwrap();
         f.set_modified(UNIX_EPOCH + Duration::from_secs(secs)).unwrap();
+    }
+
+    #[test]
+    fn config_command_selects_configured_adapter() {
+        let dir = std::env::temp_dir().join(format!("csp-cfg-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // A Cargo.toml would normally select RustAdapter; the .csp.toml command wins.
+        std::fs::write(dir.join("Cargo.toml"), "[package]\nname=\"x\"\n").unwrap();
+        std::fs::write(
+            dir.join(".csp.toml"),
+            "command = \"echo hi\"\nartifact = \"cov.info\"\n",
+        )
+        .unwrap();
+        let adapter = crate::select(&dir, None).expect("an adapter");
+        assert_eq!(adapter.name(), "configured");
+        assert!(adapter.capabilities().test_results);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

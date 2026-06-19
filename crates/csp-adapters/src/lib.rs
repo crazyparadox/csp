@@ -14,12 +14,14 @@ use std::path::{Path, PathBuf};
 use csp_core::coverage::{CoverageSummary, FileCoverage, RunId};
 use csp_core::testing::{TestItem, TestResult};
 
+pub mod config;
 pub mod go;
 pub mod istanbul;
 pub mod lcov;
 
 mod adapters;
-pub use adapters::{GenericLcovAdapter, GoAdapter, RustAdapter, TsAdapter};
+pub use adapters::{ConfiguredAdapter, GenericLcovAdapter, GoAdapter, RustAdapter, TsAdapter};
+pub use config::ProjectConfig;
 
 /// Everything one analysis pass produces. In v1 `tests`/`results` may be empty
 /// when the artifact is coverage-only; `coverage` is always the primary payload.
@@ -89,16 +91,29 @@ pub fn registry() -> Vec<Box<dyn CoverageAdapter>> {
     ]
 }
 
-/// Pick an adapter for `root`. If `hint` names a known adapter it wins; otherwise
-/// the first adapter whose `detect` returns true is used.
+/// Pick an adapter for `root`, honoring `<root>/.csp.toml` first:
+/// - a `command` yields a [`ConfiguredAdapter`] (scoped/overridden collection);
+/// - otherwise `hint` (or the config's `framework`) selects a built-in by name;
+/// - otherwise the first built-in whose `detect` returns true wins.
 pub fn select(root: &Path, hint: Option<&str>) -> Option<Box<dyn CoverageAdapter>> {
-    let reg = registry();
-    if let Some(hint) = hint {
-        if let Some(a) = registry().into_iter().find(|a| a.name() == hint) {
+    let cfg = ProjectConfig::load(root);
+    let autorun = cfg.autorun.unwrap_or(true);
+
+    if let Some(command) = &cfg.command {
+        let argv: Vec<String> = command.split_whitespace().map(str::to_owned).collect();
+        if !argv.is_empty() {
+            let artifact = cfg.artifact.clone().unwrap_or_else(|| "lcov.info".to_string());
+            return Some(Box::new(ConfiguredAdapter::new(argv, artifact, autorun)));
+        }
+    }
+
+    let framework = hint.map(str::to_owned).or(cfg.framework);
+    if let Some(name) = &framework {
+        if let Some(a) = registry().into_iter().find(|a| a.name() == name) {
             return Some(a);
         }
     }
-    reg.into_iter().find(|a| a.detect(root))
+    registry().into_iter().find(|a| a.detect(root))
 }
 
 /// Convert a filesystem path to a `file://` URI, making it absolute against
