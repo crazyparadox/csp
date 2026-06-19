@@ -2,6 +2,13 @@ import * as vscode from "vscode";
 
 import { CoverageStore } from "./coverageStore";
 
+/** A gutter hover that can render codicons. */
+function hover(text: string): vscode.MarkdownString {
+  const md = new vscode.MarkdownString(text, true);
+  md.supportThemeIcons = true;
+  return md;
+}
+
 // Paints covered / uncovered / stale lines in the gutter (and overview ruler)
 // of visible editors from the CoverageStore.
 export class DecorationManager implements vscode.Disposable {
@@ -87,9 +94,9 @@ export class DecorationManager implements vscode.Disposable {
     }
 
     const lineCount = editor.document.lineCount;
-    const coveredRanges: vscode.Range[] = [];
-    const uncoveredRanges: vscode.Range[] = [];
-    const staleRanges: vscode.Range[] = [];
+    const coveredOpts: vscode.DecorationOptions[] = [];
+    const uncoveredOpts: vscode.DecorationOptions[] = [];
+    const staleOpts: vscode.DecorationOptions[] = [];
 
     for (const { line, hits } of coverage.lines) {
       // CSP line numbers are 0-based (LSP-style), matching the editor model.
@@ -98,17 +105,20 @@ export class DecorationManager implements vscode.Disposable {
       }
       const range = new vscode.Range(line, 0, line, 0);
       if (coverage.stale) {
-        staleRanges.push(range);
+        staleOpts.push({ range, hoverMessage: hover("$(history) Coverage stale — file edited since the last run") });
       } else if (hits > 0) {
-        coveredRanges.push(range);
+        coveredOpts.push({
+          range,
+          hoverMessage: hover(`$(pass) Covered — ${hits} hit${hits === 1 ? "" : "s"}`),
+        });
       } else {
-        uncoveredRanges.push(range);
+        uncoveredOpts.push({ range, hoverMessage: hover("$(error) Not covered by any test") });
       }
     }
 
-    editor.setDecorations(this.covered, coveredRanges);
-    editor.setDecorations(this.uncovered, uncoveredRanges);
-    editor.setDecorations(this.stale, staleRanges);
+    editor.setDecorations(this.covered, coveredOpts);
+    editor.setDecorations(this.uncovered, uncoveredOpts);
+    editor.setDecorations(this.stale, staleOpts);
   }
 
   private clear(editor: vscode.TextEditor): void {

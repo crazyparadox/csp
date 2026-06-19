@@ -20,6 +20,8 @@ export const Method = {
   // Queries (client → server requests).
   Coverage: "csp/coverage",
   Summary: "csp/summary",
+  // Run control: ask the server to (re-)collect coverage now.
+  Run: "csp/run",
 } as const;
 
 export interface Position {

@@ -1,14 +1,23 @@
 {
   "name": "csp-coverage",
   "displayName": "CSP Coverage",
-  "description": "Render test coverage in the gutter from any Coverage Server Protocol (CSP) server.",
+  "description": "Live test-coverage gutters, stale markers, and quality diagnostics from any Coverage Server Protocol (CSP) server — Rust, Go, TypeScript, and more.",
   "version": "0.1.0",
   "publisher": "csp",
   "license": "MIT",
+  "icon": "media/icon.png",
+  "galleryBanner": {
+    "color": "#0d1117",
+    "theme": "dark"
+  },
+  "homepage": "https://github.com/decentparadox/csp",
+  "bugs": {
+    "url": "https://github.com/decentparadox/csp/issues"
+  },
   "repository": {
     "type": "git",
     "url": "https://github.com/decentparadox/csp.git",
-    "directory": "examples/csp-extension"
+    "directory": "clients/vs-extension"
   },
   "engines": {
     "vscode": "^1.85.0"
@@ -17,6 +26,18 @@
     "Testing",
     "Visualization"
   ],
+  "keywords": [
+    "coverage",
+    "test coverage",
+    "code coverage",
+    "gutter",
+    "csp",
+    "rust",
+    "go",
+    "typescript",
+    "lcov"
+  ],
+  "pricing": "Free",
   "main": "./out/extension.js",
   "activationEvents": [
     "onStartupFinished"
@@ -24,18 +45,39 @@
   "contributes": {
     "commands": [
       {
+        "command": "csp.refresh",
+        "title": "Refresh Coverage",
+        "category": "CSP",
+        "icon": "$(refresh)"
+      },
+      {
         "command": "csp.restart",
-        "title": "CSP: Restart Coverage Server"
+        "title": "Restart Coverage Server",
+        "category": "CSP",
+        "icon": "$(debug-restart)"
       },
       {
         "command": "csp.toggleGutters",
-        "title": "CSP: Toggle Coverage Gutters"
+        "title": "Toggle Coverage Gutters",
+        "category": "CSP",
+        "icon": "$(eye)"
       },
       {
         "command": "csp.showLog",
-        "title": "CSP: Show Server Log"
+        "title": "Show Server Log",
+        "category": "CSP",
+        "icon": "$(output)"
       }
     ],
+    "menus": {
+      "editor/title": [
+        {
+          "command": "csp.refresh",
+          "group": "navigation",
+          "when": "csp.active"
+        }
+      ]
+    },
     "configuration": {
       "title": "CSP Coverage",
       "properties": {
@@ -53,13 +95,20 @@
             "istanbul",
             "lcov"
           ],
+          "enumDescriptions": [
+            "Let the server detect the coverage tool from the project.",
+            "Rust — cargo-llvm-cov.",
+            "Go — go test -coverprofile.",
+            "JavaScript/TypeScript — Istanbul / nyc / vitest.",
+            "Any tool that emits an lcov.info report."
+          ],
           "default": "auto",
           "description": "Force a coverage adapter. 'auto' lets the server detect it from the project."
         },
         "csp.enableGutters": {
           "type": "boolean",
           "default": true,
-          "description": "Render covered/uncovered lines in the editor gutter."
+          "description": "Render covered/uncovered lines as colored bars in the editor gutter."
         },
         "csp.noAutorun": {
           "type": "boolean",
@@ -73,7 +122,8 @@
     "vscode:prepublish": "npm run build",
     "build": "node esbuild.js",
     "watch": "node esbuild.js --watch",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "package": "vsce package"
   },
   "dependencies": {
     "vscode-jsonrpc": "^8.2.0"
@@ -81,6 +131,7 @@
   "devDependencies": {
     "@types/node": "^20.11.0",
     "@types/vscode": "^1.85.0",
+    "@vscode/vsce": "^2.24.0",
     "esbuild": "^0.20.0",
     "typescript": "^5.3.0"
   }

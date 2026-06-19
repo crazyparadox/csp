@@ -1,84 +1,101 @@
-# CSP Coverage — VS Code extension
+<p align="center">
+  <img src="media/icon.png" width="96" alt="CSP Coverage" />
+</p>
 
-A reference **Coverage Server Protocol** client for VS Code. It spawns a
-`csp-server` over stdio, speaks the CSP lifecycle, and renders the coverage the
-server pushes as **gutter markers**, an **overview-ruler** heatline, a
-**status-bar** percentage, and **quality diagnostics** in the Problems panel.
+<h1 align="center">CSP Coverage</h1>
 
-This is the editor-side counterpart to the `csp-cli` debug client: where the CLI
-prints a coverage table, this paints it into the editor.
+<p align="center">
+  Live test-coverage gutters in VS Code, powered by the
+  <a href="https://github.com/decentparadox/csp">Coverage Server Protocol</a>.<br/>
+  One editor UI — Rust, Go, TypeScript, and anything that emits lcov.
+</p>
 
-```
- csp-server  ──stdio JSON-RPC──▶  this extension
-   publishCoverage            ▶   green/red gutter bars
-   publishQualityDiagnostics  ▶   Problems panel ("line not covered")
-   runStateChanged.summary    ▶   status bar  "▣ 72%"
- didOpen / didChange          ◀   stale (grey) gutter after edits
-```
+<p align="center">
+  <img alt="Version" src="https://img.shields.io/badge/version-0.1.0-blue" />
+  <img alt="License" src="https://img.shields.io/badge/license-MIT-green" />
+  <img alt="VS Code" src="https://img.shields.io/badge/VS%20Code-%5E1.85-007ACC" />
+</p>
+
+---
+
+CSP is to **test quality** what LSP is to language intelligence. This extension is
+a reference CSP **client**: it launches a `csp-server` over stdio and paints what
+the server reports straight into the editor — no manual coverage step, no
+language-specific plugin.
+
+## Features
+
+- 🟩🟥 **Coverage gutters** — continuous green/red bars (Git dirty-diff style) mark
+  covered and uncovered lines. Hover a bar to see the hit count.
+- 🩶 **Stale markers** — edit a covered file and its bars turn grey until the next
+  run, so green gutters never lie.
+- 🧪 **Status-bar coverage** — workspace line-coverage percentage, colored by level,
+  with a click-through action menu.
+- 🔍 **Quality diagnostics** — uncovered lines surface in the Problems panel.
+- ♻️ **Refresh on demand** — a toolbar/command action re-runs collection.
+- 🌐 **Language-agnostic** — Rust (`cargo-llvm-cov`), Go (`go test -coverprofile`),
+  JS/TS (Istanbul/vitest), or any `lcov.info`. The server auto-detects.
 
 ## How it works
 
-1. On activation the extension starts one `csp-server` per workspace folder
-   (`--root <folder>`), runs `initialize` → `initialized`, and listens.
-2. The server auto-collects coverage and pushes one `csp/publishCoverage` per
-   file. The extension caches these and paints the active editor.
-3. Editing a file sends `csp/didChange`; the server re-pushes that file with
-   `stale: true`, which the extension renders as grey bars so green gutters never
-   lie after an edit.
+```
+ csp-server  ──stdio JSON-RPC──▶  CSP Coverage (this extension)
+   publishCoverage            ▶   green / red gutter bars
+   publishQualityDiagnostics  ▶   Problems panel
+   runStateChanged.summary    ▶   status bar  "✓ 72%"
+ didOpen / didChange          ◀   grey (stale) bars after edits
+ run                          ◀   "Refresh Coverage" action
+```
 
-URIs are matched by **decoded filesystem path** (`Uri.fsPath`), not raw string,
-so percent-encoding or path normalisation on the server side never breaks the
-mapping (see `spec/csp.md` §1.1).
+On activation the extension starts one `csp-server` per workspace folder, runs the
+CSP lifecycle (`initialize` → `initialized`), and listens. The server auto-collects
+coverage and pushes one update per file. URIs are matched by decoded filesystem
+path, so percent-encoding or path normalisation never breaks the mapping.
 
 ## Requirements
 
 A `csp-server` binary. The extension finds one in this order:
 
-1. `csp.serverPath` setting, if set.
+1. The `csp.serverPath` setting.
 2. `<workspace>/target/{release,debug}/csp-server`.
-3. `<csp-repo>/target/{release,debug}/csp-server` (dev: this extension lives in
-   the CSP repo).
+3. `<csp-repo>/target/{release,debug}/csp-server`.
 4. `csp-server` on `PATH`.
 
-Build the reference server with:
-
-```sh
-cargo build -p csp-server          # debug
-cargo build -p csp-server --release
-```
-
-## Develop / run
-
-```sh
-cd examples/csp-extension
-npm install
-npm run build        # or: npm run watch
-```
-
-Then press **F5** ("Run CSP Extension"). It opens `examples/go-sample` in an
-Extension Development Host with gutters lit up. Try other samples by editing the
-folder argument in `.vscode/launch.json`, or just open any Rust/Go/TS project the
-server supports.
+Build the reference server with `cargo build -p csp-server --release`.
 
 ## Settings
 
 | Setting             | Default  | Description                                                        |
 | ------------------- | -------- | ------------------------------------------------------------------ |
-| `csp.serverPath`    | `""`     | Path to `csp-server`; empty = auto-discover (see above).           |
+| `csp.serverPath`    | `""`     | Path to `csp-server`; empty = auto-discover.                        |
 | `csp.framework`     | `"auto"` | Force an adapter: `cargo-llvm-cov` / `go` / `istanbul` / `lcov`.   |
-| `csp.enableGutters` | `true`   | Render covered/uncovered gutter markers.                           |
+| `csp.enableGutters` | `true`   | Render covered/uncovered gutter bars.                              |
 | `csp.noAutorun`     | `false`  | Set `CSP_NO_AUTORUN`: report an existing artifact, don't run tests. |
 
 ## Commands
 
-- **CSP: Restart Coverage Server**
+All under the **CSP** category (⇧⌘P):
+
+- **CSP: Refresh Coverage** — re-collect now.
 - **CSP: Toggle Coverage Gutters**
+- **CSP: Restart Coverage Server**
 - **CSP: Show Server Log**
 
-## Limitations (v1)
+## Develop
 
-- The client can't drive runs (`runControl` is `false` in CSP v1); the server
-  owns collection. Re-run by saving/editing or via **CSP: Restart**.
-- If a workspace is opened through a symlink, the server's canonicalised paths
-  may differ from the editor's; coverage for those files won't match.
-- The status bar shows the most recent folder's workspace summary.
+```sh
+npm install
+npm run build          # or: npm run watch
+```
+
+Press **F5** to launch an Extension Development Host against `examples/go-sample`.
+
+## Limitations
+
+- If a workspace is opened through a symlink, the server's paths may differ from
+  the editor's; coverage for those files won't attach.
+- The status bar reflects the most recent folder's workspace summary.
+
+## License
+
+[MIT](LICENSE)
