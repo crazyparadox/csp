@@ -74,10 +74,11 @@ pub trait CoverageAdapter: Send + Sync {
     }
 
     /// Produce [`RunData`] for the workspace, stamping each payload with
-    /// `run_id`. Reuses an existing artifact when present; otherwise generates
-    /// one via [`generate`](Self::generate) before parsing. Returns an error if
-    /// no artifact can be obtained or it is malformed.
-    fn collect(&self, root: &Path, run_id: &RunId) -> anyhow::Result<RunData>;
+    /// `run_id`. Reuses a fresh existing artifact; otherwise (or when `force` is
+    /// set — an explicit "run tests" request) generates one via
+    /// [`generate`](Self::generate) before parsing. Returns an error if no
+    /// artifact can be obtained or it is malformed.
+    fn collect(&self, root: &Path, run_id: &RunId, force: bool) -> anyhow::Result<RunData>;
 }
 
 /// The built-in adapters, in detection-priority order (most specific first, the

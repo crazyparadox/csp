@@ -386,13 +386,14 @@ fn ensure_artifact(
     root: &Path,
     find: fn(&Path) -> Option<PathBuf>,
     hint: &str,
+    force: bool,
 ) -> anyhow::Result<PathBuf> {
     let existing = find(root);
     if let Some(p) = &existing {
-        if artifact_is_fresh(p, root) {
+        if !force && artifact_is_fresh(p, root) {
             return Ok(p.clone());
         }
-        // Stale: a source changed after the report was produced.
+        // Stale, or an explicit re-run was requested.
     }
     if !autorun_enabled() {
         // Report-only mode: prefer a stale artifact over no coverage at all.
@@ -559,8 +560,8 @@ impl CoverageAdapter for RustAdapter {
         Ok(())
     }
 
-    fn collect(&self, root: &Path, run_id: &RunId) -> anyhow::Result<RunData> {
-        let path = ensure_artifact(self, root, find_lcov, "cargo llvm-cov --lcov")?;
+    fn collect(&self, root: &Path, run_id: &RunId, force: bool) -> anyhow::Result<RunData> {
+        let path = ensure_artifact(self, root, find_lcov, "cargo llvm-cov --lcov", force)?;
         let content = std::fs::read_to_string(&path)
             .with_context(|| format!("reading {}", path.display()))?;
         let mut data = RunData::from_coverage(run_id.clone(), lcov::parse(&content, root, run_id));
@@ -608,12 +609,13 @@ impl CoverageAdapter for GoAdapter {
         )
     }
 
-    fn collect(&self, root: &Path, run_id: &RunId) -> anyhow::Result<RunData> {
+    fn collect(&self, root: &Path, run_id: &RunId, force: bool) -> anyhow::Result<RunData> {
         let path = ensure_artifact(
             self,
             root,
             Self::find_profile,
             "go test -coverprofile=coverage.out ./...",
+            force,
         )?;
         let content = std::fs::read_to_string(&path)
             .with_context(|| format!("reading {}", path.display()))?;
@@ -671,7 +673,7 @@ impl CoverageAdapter for TsAdapter {
         )
     }
 
-    fn collect(&self, root: &Path, run_id: &RunId) -> anyhow::Result<RunData> {
+    fn collect(&self, root: &Path, run_id: &RunId, force: bool) -> anyhow::Result<RunData> {
         // Prefer the richer Istanbul JSON; reuse an LCOV report if one exists.
         if Self::find_istanbul(root).is_none() && find_lcov(root).is_some() {
             let path = find_lcov(root).unwrap();
@@ -687,6 +689,7 @@ impl CoverageAdapter for TsAdapter {
             root,
             Self::find_istanbul,
             "vitest run --coverage --coverage.provider=istanbul",
+            force,
         )?;
         let content = std::fs::read_to_string(&path)
             .with_context(|| format!("reading {}", path.display()))?;
@@ -713,7 +716,7 @@ impl CoverageAdapter for GenericLcovAdapter {
         full_caps()
     }
 
-    fn collect(&self, root: &Path, run_id: &RunId) -> anyhow::Result<RunData> {
+    fn collect(&self, root: &Path, run_id: &RunId, force: bool) -> anyhow::Result<RunData> {
         let path = find_lcov(root).context("no LCOV file found")?;
         let content = std::fs::read_to_string(&path)
             .with_context(|| format!("reading {}", path.display()))?;
@@ -816,9 +819,9 @@ impl CoverageAdapter for ConfiguredAdapter {
         Ok(())
     }
 
-    fn collect(&self, root: &Path, run_id: &RunId) -> anyhow::Result<RunData> {
+    fn collect(&self, root: &Path, run_id: &RunId, force: bool) -> anyhow::Result<RunData> {
         let artifact = self.artifact_path(root);
-        let need_gen = !(artifact.exists() && artifact_is_fresh(&artifact, root));
+        let need_gen = force || !(artifact.exists() && artifact_is_fresh(&artifact, root));
         let gen_err = if need_gen && self.autorun && autorun_enabled() {
             self.generate(root).err()
         } else {

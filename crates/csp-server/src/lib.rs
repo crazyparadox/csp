@@ -68,7 +68,13 @@ impl<W: Write> Server<W> {
             method::INITIALIZE => self.on_initialize(req),
             method::INITIALIZED => {
                 self.initialized = true;
-                self.run_analysis();
+                self.run_analysis(false);
+                Flow::Continue
+            }
+            // Explicit "run tests" from the client: re-run, forcing fresh
+            // collection (bypass the freshness fast-path).
+            method::RUN => {
+                self.run_analysis(true);
                 Flow::Continue
             }
             method::SHUTDOWN => {
@@ -92,8 +98,8 @@ impl<W: Write> Server<W> {
                 Flow::Continue
             }
 
-            // Reserved run-control methods are unimplemented in report-only v1.
-            method::RUN | method::CANCEL | method::RUN_PROGRESS => {
+            // Still reserved / unimplemented.
+            method::CANCEL | method::RUN_PROGRESS => {
                 self.respond_err(req.id, ResponseError::method_not_found(&req.method));
                 Flow::Continue
             }
@@ -206,8 +212,9 @@ impl<W: Write> Server<W> {
 
     // --- analysis + pushes ---
 
-    /// Run the selected adapter and push everything it produced.
-    fn run_analysis(&mut self) {
+    /// Run the selected adapter and push everything it produced. `force`
+    /// bypasses the freshness fast-path (an explicit "run tests" request).
+    fn run_analysis(&mut self, force: bool) {
         // Take the adapter out so we can call `&mut self` push helpers while using
         // it; it is restored before returning.
         let Some(adapter) = self.adapter.take() else {
@@ -226,7 +233,7 @@ impl<W: Write> Server<W> {
             },
         );
 
-        let data = match adapter.collect(&self.root, &run_id) {
+        let data = match adapter.collect(&self.root, &run_id, force) {
             Ok(d) => d,
             Err(e) => {
                 let reason = format!("{e:#}");
@@ -480,15 +487,34 @@ mod tests {
     }
 
     #[test]
-    fn run_control_is_method_not_found() {
+    fn cancel_is_method_not_found() {
         let root = temp_lcov_workspace("runctl");
         let mut buf = Vec::new();
         {
             let mut server = Server::new(&mut buf, root, None);
-            server.handle(req(5, method::RUN, Value::Null));
+            server.handle(req(5, method::CANCEL, Value::Null));
         }
         let msgs = drain(&buf);
         assert_eq!(msgs[0]["error"]["code"], error_code::METHOD_NOT_FOUND);
+    }
+
+    #[test]
+    fn run_reanalyzes_and_pushes_coverage() {
+        let root = temp_lcov_workspace("rerun");
+        let mut buf = Vec::new();
+        {
+            let mut server = Server::new(&mut buf, root, None);
+            server.handle(req(1, method::INITIALIZE, Value::Null));
+            server.handle(notif(method::INITIALIZED, Value::Null));
+            server.handle(req(2, method::RUN, Value::Null));
+        }
+        // The explicit run produces a second batch of coverage + run-state pushes.
+        let msgs = drain(&buf);
+        let coverage_pushes = msgs
+            .iter()
+            .filter(|m| m["method"] == method::PUBLISH_COVERAGE)
+            .count();
+        assert!(coverage_pushes >= 2, "initial run + forced re-run");
     }
 
     #[test]
