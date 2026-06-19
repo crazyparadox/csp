@@ -1,0 +1,16 @@
+[package]
+name = "csp-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Debug client for CSP: spawns a csp-server and prints the coverage it reports"
+
+[[bin]]
+name = "csp-cli"
+path = "src/main.rs"
+
+[dependencies]
+csp-core = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }

@@ -1,0 +1,22 @@
+[package]
+name = "csp-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Reference CSP server: parses coverage artifacts and serves them over stdio JSON-RPC"
+
+[[bin]]
+name = "csp-server"
+path = "src/main.rs"
+
+[lib]
+name = "csp_server"
+path = "src/lib.rs"
+
+[dependencies]
+csp-core = { workspace = true }
+csp-adapters = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }

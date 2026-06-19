@@ -1,0 +1,23 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/csp-core",
+    "crates/csp-adapters",
+    "crates/csp-server",
+    "clients/cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/decentparadox/csp"
+
+[workspace.dependencies]
+csp-core = { path = "crates/csp-core" }
+csp-adapters = { path = "crates/csp-adapters" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+schemars = "0.8"
+anyhow = "1"
+thiserror = "2"

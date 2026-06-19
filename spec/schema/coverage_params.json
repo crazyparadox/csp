@@ -1,0 +1,64 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "CoverageParams",
+  "type": "object",
+  "required": [
+    "uri"
+  ],
+  "properties": {
+    "range": {
+      "description": "Optional sub-range; omitted means the whole file.",
+      "anyOf": [
+        {
+          "$ref": "#/definitions/Range"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "uri": {
+      "type": "string"
+    }
+  },
+  "definitions": {
+    "Position": {
+      "description": "Zero-based line/character position, identical in shape to LSP `Position`.",
+      "type": "object",
+      "required": [
+        "character",
+        "line"
+      ],
+      "properties": {
+        "character": {
+          "description": "Zero-based character offset within the line (UTF-16 code units, as in LSP).",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "line": {
+          "description": "Zero-based line number.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        }
+      }
+    },
+    "Range": {
+      "description": "A range between two positions, end-exclusive — identical to LSP `Range`.",
+      "type": "object",
+      "required": [
+        "end",
+        "start"
+      ],
+      "properties": {
+        "end": {
+          "$ref": "#/definitions/Position"
+        },
+        "start": {
+          "$ref": "#/definitions/Position"
+        }
+      }
+    }
+  }
+}

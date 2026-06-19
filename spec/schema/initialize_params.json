@@ -1,0 +1,53 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "InitializeParams",
+  "description": "Parameters of the `initialize` request.",
+  "type": "object",
+  "required": [
+    "capabilities"
+  ],
+  "properties": {
+    "capabilities": {
+      "$ref": "#/definitions/ClientCapabilities"
+    },
+    "framework": {
+      "description": "Optional hint naming the test framework/tool to use (e.g. `\"cargo-llvm-cov\"`).",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "rootUri": {
+      "description": "Absolute path of the workspace root the server should analyse.",
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "definitions": {
+    "ClientCapabilities": {
+      "description": "Capabilities the client advertises to the server.",
+      "type": "object",
+      "required": [
+        "coverageGutter",
+        "staleness",
+        "testResults"
+      ],
+      "properties": {
+        "coverageGutter": {
+          "description": "Client can render coverage in the editor gutter.",
+          "type": "boolean"
+        },
+        "staleness": {
+          "description": "Client understands `stale` flags and will visually distinguish stale data.",
+          "type": "boolean"
+        },
+        "testResults": {
+          "description": "Client can display test results inline / in a panel.",
+          "type": "boolean"
+        }
+      }
+    }
+  }
+}

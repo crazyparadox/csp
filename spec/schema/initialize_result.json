@@ -1,0 +1,80 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "InitializeResult",
+  "description": "Result of the `initialize` request.",
+  "type": "object",
+  "required": [
+    "capabilities"
+  ],
+  "properties": {
+    "capabilities": {
+      "$ref": "#/definitions/ServerCapabilities"
+    },
+    "serverInfo": {
+      "description": "Server name/version for logging, e.g. `\"csp-server 0.1.0 (rust/llvm-cov)\"`.",
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "definitions": {
+    "CoverageCapabilities": {
+      "description": "Which coverage granularities a server can produce.",
+      "type": "object",
+      "required": [
+        "branch",
+        "function",
+        "line"
+      ],
+      "properties": {
+        "branch": {
+          "type": "boolean"
+        },
+        "function": {
+          "type": "boolean"
+        },
+        "line": {
+          "type": "boolean"
+        }
+      }
+    },
+    "ServerCapabilities": {
+      "description": "Quality domains a server supports. Each flag gates a family of methods, so a client can hide UI for domains the server doesn't implement.",
+      "type": "object",
+      "required": [
+        "coverage",
+        "qualityDiagnostics",
+        "runControl",
+        "testMapping",
+        "testResults"
+      ],
+      "properties": {
+        "coverage": {
+          "description": "Emits `csp/publishCoverage` and answers `csp/coverage`.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/CoverageCapabilities"
+            }
+          ]
+        },
+        "qualityDiagnostics": {
+          "description": "Emits `csp/publishQualityDiagnostics`.",
+          "type": "boolean"
+        },
+        "runControl": {
+          "description": "Reserved for v-next. Always `false` in the report-only v1: the server observes existing test output rather than executing tests itself.",
+          "type": "boolean"
+        },
+        "testMapping": {
+          "description": "Answers `csp/testsForRange` and `csp/rangeForTest`.",
+          "type": "boolean"
+        },
+        "testResults": {
+          "description": "Emits `csp/publishTestResults` and `csp/runStateChanged`.",
+          "type": "boolean"
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,105 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "PublishQualityDiagnosticsParams",
+  "description": "Params of `csp/publishQualityDiagnostics`. Mirrors LSP `publishDiagnostics`: a full replacement set for the given file.",
+  "type": "object",
+  "required": [
+    "diagnostics",
+    "uri"
+  ],
+  "properties": {
+    "diagnostics": {
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/Diagnostic"
+      }
+    },
+    "uri": {
+      "type": "string"
+    }
+  },
+  "definitions": {
+    "Diagnostic": {
+      "description": "A quality diagnostic. Structurally a subset of the LSP `Diagnostic`, carrying an extra `source`/`code` so coverage-gap and flaky-test findings can be told apart in the UI.",
+      "type": "object",
+      "required": [
+        "message",
+        "range",
+        "severity"
+      ],
+      "properties": {
+        "code": {
+          "description": "Machine-readable code, e.g. `\"uncovered-line\"`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "message": {
+          "type": "string"
+        },
+        "range": {
+          "$ref": "#/definitions/Range"
+        },
+        "severity": {
+          "$ref": "#/definitions/DiagnosticSeverity"
+        },
+        "source": {
+          "description": "Producer of the diagnostic, e.g. `\"csp.coverage\"` or `\"csp.flaky\"`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "DiagnosticSeverity": {
+      "description": "Severity of a quality diagnostic.\n\nSerialized as a lower-case string. The mapping to LSP's numeric `DiagnosticSeverity` is: `error` → 1, `warning` → 2, `information` → 3, `hint` → 4.",
+      "type": "string",
+      "enum": [
+        "error",
+        "warning",
+        "information",
+        "hint"
+      ]
+    },
+    "Position": {
+      "description": "Zero-based line/character position, identical in shape to LSP `Position`.",
+      "type": "object",
+      "required": [
+        "character",
+        "line"
+      ],
+      "properties": {
+        "character": {
+          "description": "Zero-based character offset within the line (UTF-16 code units, as in LSP).",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "line": {
+          "description": "Zero-based line number.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        }
+      }
+    },
+    "Range": {
+      "description": "A range between two positions, end-exclusive — identical to LSP `Range`.",
+      "type": "object",
+      "required": [
+        "end",
+        "start"
+      ],
+      "properties": {
+        "end": {
+          "$ref": "#/definitions/Position"
+        },
+        "start": {
+          "$ref": "#/definitions/Position"
+        }
+      }
+    }
+  }
+}

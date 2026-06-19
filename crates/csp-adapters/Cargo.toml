@@ -1,0 +1,13 @@
+[package]
+name = "csp-adapters"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Coverage adapters for CSP: parse tool output (lcov, go cover, istanbul) into CSP types"
+
+[dependencies]
+csp-core = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }

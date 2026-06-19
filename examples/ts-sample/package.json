@@ -1,0 +1,12 @@
+{
+  "name": "ts-sample",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "test": "vitest run --coverage"
+  },
+  "devDependencies": {
+    "vitest": "^2.0.0",
+    "@vitest/coverage-istanbul": "^2.0.0"
+  }
+}

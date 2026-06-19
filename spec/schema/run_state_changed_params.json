@@ -1,0 +1,90 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "RunStateChangedParams",
+  "description": "Params of `csp/runStateChanged`.",
+  "type": "object",
+  "required": [
+    "runId",
+    "state"
+  ],
+  "properties": {
+    "message": {
+      "description": "Human-readable detail, primarily the reason on `errored` (e.g. the tool failed or isn't installed).",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "runId": {
+      "type": "string"
+    },
+    "state": {
+      "$ref": "#/definitions/RunState"
+    },
+    "summary": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/CoverageSummary"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    }
+  },
+  "definitions": {
+    "CoverageSummary": {
+      "description": "Rolled-up counts for a file or a whole workspace. `covered`/`total` are kept raw so the client can compute percentages and aggregate without precision loss.",
+      "type": "object",
+      "required": [
+        "branchesCovered",
+        "branchesTotal",
+        "functionsCovered",
+        "functionsTotal",
+        "linesCovered",
+        "linesTotal"
+      ],
+      "properties": {
+        "branchesCovered": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "branchesTotal": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "functionsCovered": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "functionsTotal": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "linesCovered": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "linesTotal": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        }
+      }
+    },
+    "RunState": {
+      "description": "State of a test run, reported via `csp/runStateChanged`.",
+      "type": "string",
+      "enum": [
+        "running",
+        "finished",
+        "errored"
+      ]
+    }
+  }
+}

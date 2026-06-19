@@ -1,0 +1,59 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "SummaryResult",
+  "type": "object",
+  "required": [
+    "summary"
+  ],
+  "properties": {
+    "summary": {
+      "$ref": "#/definitions/CoverageSummary"
+    }
+  },
+  "definitions": {
+    "CoverageSummary": {
+      "description": "Rolled-up counts for a file or a whole workspace. `covered`/`total` are kept raw so the client can compute percentages and aggregate without precision loss.",
+      "type": "object",
+      "required": [
+        "branchesCovered",
+        "branchesTotal",
+        "functionsCovered",
+        "functionsTotal",
+        "linesCovered",
+        "linesTotal"
+      ],
+      "properties": {
+        "branchesCovered": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "branchesTotal": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "functionsCovered": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "functionsTotal": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "linesCovered": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "linesTotal": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        }
+      }
+    }
+  }
+}

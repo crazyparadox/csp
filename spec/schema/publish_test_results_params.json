@@ -1,0 +1,136 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "PublishTestResultsParams",
+  "description": "Params of `csp/publishTestResults`. Results are batched per notification but always tagged with `run_id` so the client can group them.",
+  "type": "object",
+  "required": [
+    "results",
+    "runId"
+  ],
+  "properties": {
+    "results": {
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/TestResult"
+      }
+    },
+    "runId": {
+      "type": "string"
+    }
+  },
+  "definitions": {
+    "Location": {
+      "description": "A location inside a document — a URI plus a range. Mirrors LSP `Location`.",
+      "type": "object",
+      "required": [
+        "range",
+        "uri"
+      ],
+      "properties": {
+        "range": {
+          "$ref": "#/definitions/Range"
+        },
+        "uri": {
+          "type": "string"
+        }
+      }
+    },
+    "Position": {
+      "description": "Zero-based line/character position, identical in shape to LSP `Position`.",
+      "type": "object",
+      "required": [
+        "character",
+        "line"
+      ],
+      "properties": {
+        "character": {
+          "description": "Zero-based character offset within the line (UTF-16 code units, as in LSP).",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "line": {
+          "description": "Zero-based line number.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        }
+      }
+    },
+    "Range": {
+      "description": "A range between two positions, end-exclusive — identical to LSP `Range`.",
+      "type": "object",
+      "required": [
+        "end",
+        "start"
+      ],
+      "properties": {
+        "end": {
+          "$ref": "#/definitions/Position"
+        },
+        "start": {
+          "$ref": "#/definitions/Position"
+        }
+      }
+    },
+    "TestResult": {
+      "description": "The result of executing one test in a run.",
+      "type": "object",
+      "required": [
+        "id",
+        "name",
+        "runId",
+        "status"
+      ],
+      "properties": {
+        "durationMs": {
+          "description": "Wall-clock duration in milliseconds, if measured.",
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "id": {
+          "type": "string"
+        },
+        "location": {
+          "description": "Location to surface the failure at (e.g. the failing assertion).",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/Location"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "message": {
+          "description": "Failure/skip message or assertion output.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "name": {
+          "type": "string"
+        },
+        "runId": {
+          "type": "string"
+        },
+        "status": {
+          "$ref": "#/definitions/TestStatus"
+        }
+      }
+    },
+    "TestStatus": {
+      "description": "Outcome of running a single test.",
+      "type": "string",
+      "enum": [
+        "pass",
+        "fail",
+        "skip"
+      ]
+    }
+  }
+}

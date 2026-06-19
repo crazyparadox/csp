@@ -1,0 +1,231 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "CoverageResult",
+  "description": "Result of `csp/coverage`. `null`/absent when no coverage is known for the file.",
+  "type": "object",
+  "properties": {
+    "coverage": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/FileCoverage"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    }
+  },
+  "definitions": {
+    "BranchCoverage": {
+      "description": "Branch coverage for a single branch point (e.g. the two arms of an `if`).",
+      "type": "object",
+      "required": [
+        "arms",
+        "range"
+      ],
+      "properties": {
+        "arms": {
+          "description": "Hit count per branch arm, in source order.",
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0.0
+          }
+        },
+        "range": {
+          "description": "Source range of the branching construct.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/Range"
+            }
+          ]
+        }
+      }
+    },
+    "CoverageSummary": {
+      "description": "Rolled-up counts for a file or a whole workspace. `covered`/`total` are kept raw so the client can compute percentages and aggregate without precision loss.",
+      "type": "object",
+      "required": [
+        "branchesCovered",
+        "branchesTotal",
+        "functionsCovered",
+        "functionsTotal",
+        "linesCovered",
+        "linesTotal"
+      ],
+      "properties": {
+        "branchesCovered": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "branchesTotal": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "functionsCovered": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "functionsTotal": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "linesCovered": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "linesTotal": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        }
+      }
+    },
+    "FileCoverage": {
+      "description": "Coverage for a single file, the unit of the `csp/publishCoverage` push.\n\n`version` records the document version the coverage was computed against, and `stale` is set by the server once it knows the source has advanced past that version — so the client can grey out or drop markers without re-querying.",
+      "type": "object",
+      "required": [
+        "lines",
+        "runId",
+        "summary",
+        "uri"
+      ],
+      "properties": {
+        "branches": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/BranchCoverage"
+          }
+        },
+        "functions": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/FunctionCoverage"
+          }
+        },
+        "lines": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/LineCoverage"
+          }
+        },
+        "runId": {
+          "type": "string"
+        },
+        "stale": {
+          "description": "Whether the coverage is known to be out of date relative to the open buffer.",
+          "default": false,
+          "type": "boolean"
+        },
+        "summary": {
+          "$ref": "#/definitions/CoverageSummary"
+        },
+        "uri": {
+          "type": "string"
+        },
+        "version": {
+          "description": "Document version this coverage corresponds to, if known.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int32"
+        }
+      }
+    },
+    "FunctionCoverage": {
+      "description": "Function/method coverage.",
+      "type": "object",
+      "required": [
+        "hits",
+        "name",
+        "range"
+      ],
+      "properties": {
+        "hits": {
+          "description": "Times the function was entered. `0` means uncovered.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "name": {
+          "type": "string"
+        },
+        "range": {
+          "description": "Range of the function signature/definition.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/Range"
+            }
+          ]
+        }
+      }
+    },
+    "LineCoverage": {
+      "description": "Per-line execution count.",
+      "type": "object",
+      "required": [
+        "hits",
+        "line"
+      ],
+      "properties": {
+        "hits": {
+          "description": "Number of times the line was executed. `0` means uncovered.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "line": {
+          "description": "Zero-based line number.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        }
+      }
+    },
+    "Position": {
+      "description": "Zero-based line/character position, identical in shape to LSP `Position`.",
+      "type": "object",
+      "required": [
+        "character",
+        "line"
+      ],
+      "properties": {
+        "character": {
+          "description": "Zero-based character offset within the line (UTF-16 code units, as in LSP).",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "line": {
+          "description": "Zero-based line number.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        }
+      }
+    },
+    "Range": {
+      "description": "A range between two positions, end-exclusive — identical to LSP `Range`.",
+      "type": "object",
+      "required": [
+        "end",
+        "start"
+      ],
+      "properties": {
+        "end": {
+          "$ref": "#/definitions/Position"
+        },
+        "start": {
+          "$ref": "#/definitions/Position"
+        }
+      }
+    }
+  }
+}
