@@ -10,15 +10,122 @@
 //! Auto-generation can be disabled by setting `CSP_NO_AUTORUN` (then a missing
 //! artifact is simply reported as no coverage).
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::Context;
+use csp_core::base::{Location, Range};
 use csp_core::capabilities::{CoverageCapabilities, ServerCapabilities};
 use csp_core::coverage::RunId;
 use csp_core::testing::{TestResult, TestStatus};
 
-use crate::{go, istanbul, lcov, CoverageAdapter, RunData};
+use crate::{go, istanbul, lcov, path_to_uri, CoverageAdapter, RunData};
+
+/// Attach a source [`Location`] to each test by scanning the workspace for
+/// `#[test]` functions and matching on the test's leaf name. Best-effort: names
+/// it can't resolve are left without a location.
+fn attach_test_locations(results: &mut [TestResult], root: &Path) {
+    if results.is_empty() {
+        return;
+    }
+    let locations = resolve_test_locations(root);
+    for r in results.iter_mut() {
+        let leaf = r.name.rsplit("::").next().unwrap_or(&r.name);
+        if let Some(candidates) = locations.get(leaf) {
+            if let Some((rel, line)) = choose_location(&r.name, candidates) {
+                r.location = Some(Location {
+                    uri: path_to_uri(root, rel),
+                    range: Range::whole_line(*line),
+                });
+            }
+        }
+    }
+}
+
+/// When a leaf test name resolves to several files, prefer one whose file stem
+/// appears as a module segment of the full test name (e.g. `engine::tests::foo`
+/// → `engine.rs`); otherwise take the first.
+fn choose_location<'a>(name: &str, candidates: &'a [(String, u32)]) -> Option<&'a (String, u32)> {
+    if candidates.len() == 1 {
+        return candidates.first();
+    }
+    let segments: Vec<&str> = name.split("::").collect();
+    candidates
+        .iter()
+        .find(|(path, _)| {
+            let stem = Path::new(path)
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("");
+            segments.iter().any(|seg| *seg == stem)
+        })
+        .or_else(|| candidates.first())
+}
+
+/// Map each `#[test]` function's leaf name to the source files + 0-based lines
+/// where it is defined. Walks `.rs` files, skipping build/output dirs.
+fn resolve_test_locations(root: &Path) -> HashMap<String, Vec<(String, u32)>> {
+    fn walk(dir: &Path, root: &Path, map: &mut HashMap<String, Vec<(String, u32)>>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(ft) = entry.file_type() else { continue };
+            if ft.is_dir() {
+                if !is_ignored_dir(&path) {
+                    walk(&path, root, map);
+                }
+            } else if ft.is_file() && path.extension().map(|e| e == "rs").unwrap_or(false) {
+                let Ok(content) = std::fs::read_to_string(&path) else {
+                    continue;
+                };
+                let rel = path
+                    .strip_prefix(root)
+                    .unwrap_or(&path)
+                    .to_string_lossy()
+                    .into_owned();
+                // After a `#[test]`-style attribute, the next `fn NAME` within a
+                // few lines (past other attributes) is that test's definition.
+                let mut look = 0u32;
+                for (i, line) in content.lines().enumerate() {
+                    let t = line.trim_start();
+                    if t.starts_with("#[") && t.contains("test]") {
+                        look = 6;
+                        continue;
+                    }
+                    if look > 0 {
+                        if let Some(name) = parse_fn_name(t) {
+                            map.entry(name).or_default().push((rel.clone(), i as u32));
+                            look = 0;
+                        } else if !t.starts_with("#[") && !t.is_empty() {
+                            look -= 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let mut map = HashMap::new();
+    walk(root, root, &mut map);
+    map
+}
+
+/// Extract the function name from a line like `fn foo(`, `pub async fn foo<T>(`.
+fn parse_fn_name(line: &str) -> Option<String> {
+    let idx = line.find("fn ")?;
+    // Require `fn ` to start a token (line start or preceded by whitespace).
+    if idx != 0 && !line[..idx].ends_with(char::is_whitespace) {
+        return None;
+    }
+    let rest = &line[idx + 3..];
+    let name: String = rest
+        .chars()
+        .take_while(|c| c.is_alphanumeric() || *c == '_')
+        .collect();
+    (!name.is_empty()).then_some(name)
+}
 
 /// Where the Rust adapter stashes parsed test results between runs. Lives under
 /// `target/` (ignored by the freshness walk and the artifact search) so it is
@@ -442,6 +549,8 @@ impl CoverageAdapter for RustAdapter {
         // them (and reuse them on the freshness fast path). run_id is stamped at
         // read time, so store with an empty placeholder.
         let results = parse_cargo_test_output(&String::from_utf8_lossy(&output.stdout), &String::new());
+        let mut results = results;
+        attach_test_locations(&mut results, root);
         if !results.is_empty() {
             if let Ok(json) = serde_json::to_vec(&results) {
                 let _ = std::fs::write(root.join(TEST_RESULTS_SIDECAR), json);
@@ -681,6 +790,8 @@ impl CoverageAdapter for ConfiguredAdapter {
 
         // Best-effort test results from libtest-style stdout.
         let results = parse_cargo_test_output(&String::from_utf8_lossy(&output.stdout), &String::new());
+        let mut results = results;
+        attach_test_locations(&mut results, root);
         if !results.is_empty() {
             if let Ok(json) = serde_json::to_vec(&results) {
                 let _ = std::fs::write(root.join(TEST_RESULTS_SIDECAR), json);
@@ -752,6 +863,48 @@ mod tests {
     fn set_mtime(path: &Path, secs: u64) {
         let f = std::fs::OpenOptions::new().write(true).open(path).unwrap();
         f.set_modified(UNIX_EPOCH + Duration::from_secs(secs)).unwrap();
+    }
+
+    #[test]
+    fn resolves_test_locations_from_source() {
+        let dir = std::env::temp_dir().join(format!("csp-loc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(
+            dir.join("src/math.rs"),
+            "pub fn add() {}\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn adds() {}\n    #[test]\n    #[ignore]\n    fn skips() {}\n}\n",
+        )
+        .unwrap();
+
+        let mut results = vec![
+            TestResult {
+                id: "tests::adds".into(),
+                name: "tests::adds".into(),
+                status: TestStatus::Pass,
+                run_id: "r".into(),
+                message: None,
+                location: None,
+                duration_ms: None,
+            },
+            TestResult {
+                id: "tests::skips".into(),
+                name: "tests::skips".into(),
+                status: TestStatus::Skip,
+                run_id: "r".into(),
+                message: None,
+                location: None,
+                duration_ms: None,
+            },
+        ];
+        attach_test_locations(&mut results, &dir);
+
+        // `adds` is on 0-based line 4 (after the two attribute lines past `#[test]`).
+        let adds = results[0].location.as_ref().expect("located");
+        assert!(adds.uri.ends_with("src/math.rs"));
+        assert_eq!(adds.range.start.line, 4);
+        // `skips` has `#[test]` then `#[ignore]` then `fn` on line 7.
+        assert_eq!(results[1].location.as_ref().unwrap().range.start.line, 7);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
