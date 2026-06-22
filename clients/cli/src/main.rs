@@ -22,6 +22,7 @@ fn main() -> Result<()> {
     let mut root = std::env::current_dir()?;
     let mut framework: Option<String> = None;
     let mut server_path: Option<PathBuf> = None;
+    let mut rerun: Option<String> = None;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -29,6 +30,7 @@ fn main() -> Result<()> {
             "--root" => root = PathBuf::from(args.next().context("--root needs a value")?),
             "--framework" => framework = args.next(),
             "--server" => server_path = args.next().map(PathBuf::from),
+            "--rerun" => rerun = args.next(),
             "--help" | "-h" => {
                 eprintln!("usage: csp-cli [--root <path>] [--framework <name>] [--server <path>]");
                 return Ok(());
@@ -102,6 +104,28 @@ fn main() -> Result<()> {
                 }
             }
             _ => {}
+        }
+    }
+
+    // 3b. optional selective re-run: csp/run with a filter; expect partial results.
+    if let Some(name) = rerun.as_deref() {
+        println!("\nselective re-run: {name}");
+        send(
+            &mut stdin,
+            notification(method::RUN, json!({ "filter": [name] })),
+        )?;
+        loop {
+            let msg = match jsonrpc::read_value(&mut stdout) {
+                Ok(m) => m,
+                Err(_) => break,
+            };
+            if msg["method"] == method::PUBLISH_TEST_RESULTS {
+                let results = msg["params"]["results"].as_array().cloned().unwrap_or_default();
+                let partial = msg["params"]["partial"].as_bool().unwrap_or(false);
+                let names: Vec<&str> = results.iter().filter_map(|r| r["name"].as_str()).collect();
+                println!("  partial={partial} results: {names:?}");
+                break;
+            }
         }
     }
 

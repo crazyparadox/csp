@@ -11,9 +11,21 @@
 
 use std::io::{self, BufReader, Write};
 use std::path::PathBuf;
+use std::sync::mpsc;
+use std::thread;
 
-use csp_core::jsonrpc::{self, TransportError};
-use csp_server::{Flow, Server};
+use csp_core::coverage::RunId;
+use csp_core::jsonrpc::{self, Request, TransportError};
+use csp_server::{Flow, RunOutcome, Server};
+
+/// Everything the single-threaded event loop reacts to: an inbound client
+/// message (from the stdin reader thread) or a finished run (from a worker).
+enum Event {
+    Client(Request),
+    /// The stdin stream ended / errored — no more client messages will arrive.
+    ClientClosed,
+    RunDone(RunId, RunOutcome),
+}
 
 fn main() {
     let mut root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
@@ -36,25 +48,67 @@ fn main() {
         }
     }
 
-    let stdin = io::stdin();
-    let mut reader = BufReader::new(stdin.lock());
-    // Lock stdout once and hand it to the server for the lifetime of the process.
+    // One channel funnels both inbound messages and worker results to the main
+    // thread, which is the sole owner of the output writer and server state — so
+    // a long run never blocks message handling, yet there are no locks.
+    let (tx, rx) = mpsc::channel::<Event>();
+
+    // Reader thread: blocking stdin reads, forwarded as events.
+    {
+        let tx = tx.clone();
+        thread::spawn(move || {
+            let stdin = io::stdin();
+            let mut reader = BufReader::new(stdin.lock());
+            loop {
+                match jsonrpc::read_message(&mut reader) {
+                    Ok(req) => {
+                        if tx.send(Event::Client(req)).is_err() {
+                            return;
+                        }
+                    }
+                    Err(TransportError::Closed) => {
+                        let _ = tx.send(Event::ClientClosed);
+                        return;
+                    }
+                    Err(e) => {
+                        eprintln!("[csp-server] transport error: {e}");
+                        let _ = tx.send(Event::ClientClosed);
+                        return;
+                    }
+                }
+            }
+        });
+    }
+
     let stdout = io::stdout();
     let mut server = Server::new(stdout.lock(), root, framework);
 
-    loop {
-        match jsonrpc::read_message(&mut reader) {
-            Ok(req) => {
+    for event in rx {
+        match event {
+            Event::Client(req) => {
                 if server.handle(req) == Flow::Exit {
                     break;
                 }
+                spawn_pending(&mut server, &tx);
             }
-            Err(TransportError::Closed) => break, // client hung up
-            Err(e) => {
-                eprintln!("[csp-server] transport error: {e}");
-                break;
+            Event::RunDone(run_id, result) => {
+                server.apply_run_result(run_id, result);
+                spawn_pending(&mut server, &tx);
             }
+            Event::ClientClosed => break,
         }
     }
+
     let _ = io::stdout().flush();
+}
+
+/// Spawn a worker thread for each queued run; each reports back via `tx`.
+fn spawn_pending<W: Write>(server: &mut Server<W>, tx: &mpsc::Sender<Event>) {
+    for req in server.take_pending_runs() {
+        let tx = tx.clone();
+        thread::spawn(move || {
+            let result = req.run();
+            let _ = tx.send(Event::RunDone(req.run_id, result));
+        });
+    }
 }

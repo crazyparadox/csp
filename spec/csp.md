@@ -14,15 +14,19 @@ By standardising this, an editor implements coverage gutters, a test panel, and
 quality diagnostics **once**, and any CSP server — for Rust, Go, TypeScript, or
 anything else — lights them up.
 
-> **Status: client-observational; the server auto-collects.** A *client* cannot
-> drive test runs in v1 — the `runControl` capability is `false`, and the
-> client-driven run-control methods (`csp/run`, `csp/cancel`, `csp/runProgress`)
-> are reserved for a future version. The *server*, however, is responsible for
-> producing coverage: the reference server reuses an existing coverage artifact
-> when present and otherwise **runs the project's coverage tool itself**
-> (`cargo llvm-cov`, `go test -coverprofile`, `vitest --coverage`) before pushing
-> results, so the editor shows coverage without the user generating anything by
-> hand. Server auto-collection can be disabled with `CSP_NO_AUTORUN`.
+> **Status: the server owns collection; the client triggers whole-workspace
+> runs.** The server is responsible for producing coverage and test results: the
+> reference server reuses an existing coverage artifact when present and otherwise
+> **runs the project's coverage tool itself** (`cargo llvm-cov`,
+> `go test -coverprofile`, `vitest --coverage`) before pushing results — so the
+> editor shows data without the user generating anything by hand. Auto-collection
+> can be disabled with `CSP_NO_AUTORUN`; per-project commands are configured via
+> [`.csp.toml`](#11-project-configuration-csptoml).
+>
+> The client may force a fresh **whole-workspace** run with `csp/run` (the
+> `runControl` capability advertises this). *Selective* run control —
+> `csp/cancel`, `csp/runProgress`, and running a specific test or filter — remains
+> reserved for a future version.
 
 ---
 
@@ -114,17 +118,19 @@ Result: [`initialize_result.json`](./schema/initialize_result.json)
   "capabilities": {
     "coverage": { "line": true, "branch": true, "function": true },
     "testResults": true,
-    "testMapping": true,
+    "testMapping": false,
     "qualityDiagnostics": true,
-    "runControl": false
+    "runControl": true
   },
   "serverInfo": "csp-server 0.1.0 (rust/llvm-cov)"
 }
 ```
 
 A client **must** honour the server's advertised capabilities: do not call
-`csp/testsForRange` unless `testMapping` is true, etc. A server **must** advertise
-`runControl: false` in v1.
+`csp/testsForRange` unless `testMapping` is true, nor `csp/run` unless
+`runControl` is true. The reference server advertises `runControl: true`
+(whole-workspace re-run) and `testMapping: false` (the test↔code query methods
+are reserved).
 
 ### `initialized` (notification)
 
@@ -245,17 +251,25 @@ coverage dump. All gated by capabilities (§3).
 
 ---
 
-## 8. Reserved: run control (v-next)
+## 8. Run control
 
-Declared here so clients and servers can plan for it, but **not part of v1**. When
-`runControl` is advertised `true` in a future version, a client may drive runs:
+Gated by the `runControl` capability.
 
-- `csp/run` `{ testIds?, uri? }` → start a run, returns a `runId`.
-- `csp/cancel` `{ runId }` → cancel it.
-- `csp/runProgress` (notification) → streaming progress, DAP-style.
+**Implemented in v1:**
 
-Because run control executes project code, it must be gated behind explicit user
-consent in the client. v1 servers return `MethodNotFound` (`-32601`) for these.
+- `csp/run` (notification) → force a fresh **whole-workspace** run, bypassing the
+  freshness fast-path. The server re-collects coverage and tests and pushes the
+  usual `csp/publishCoverage` / `csp/publishTestResults` / `csp/runStateChanged`
+  sequence. A client typically wires this to a "Run tests" button.
+
+**Reserved for a future version** (servers return `MethodNotFound`, `-32601`):
+
+- `csp/run` with a **selector** (`{ testIds?, uri?, filter? }`) → run a subset.
+- `csp/cancel` `{ runId }` → cancel an in-flight run.
+- `csp/runProgress` (notification) → stream per-test results as they complete.
+
+Because run control executes project code, it should be gated behind user trust
+in the client.
 
 ---
 
@@ -275,3 +289,27 @@ directly from the `csp-core` Rust types** (`cargo run -p csp-core --example
 gen_schema`). They are the machine-checkable contract; this prose is the
 explanation. If the two ever disagree, the schema — being generated from the
 implementation — wins, and the prose is the bug.
+
+---
+
+## 11. Project configuration (`.csp.toml`)
+
+This is a *server implementation* convention, not a wire message, but it's the
+escape hatch that makes auto-collection workable on real repos. A server reads
+`<root>/.csp.toml` to scope or override how coverage is produced — essential for
+a large monorepo whose whole-workspace instrumented build doesn't compile, or
+where you want coverage scoped to one package.
+
+```toml
+# Run a specific command to produce the coverage artifact (argv, whitespace-split).
+command = "cargo llvm-cov -p my_crate --ignore-run-fail --lcov --output-path lcov.info"
+# The artifact that command writes, relative to the root (default: lcov.info).
+# Parsed by extension: .json → Istanbul, .out/.txt → Go profile, else → LCOV.
+artifact = "lcov.info"
+# Or force a built-in adapter instead of auto-detection.
+framework = "go"
+# Or disable auto-running entirely for this project (report-only).
+autorun = false
+```
+
+All fields are optional; an absent file means "auto-detect everything."

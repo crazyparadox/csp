@@ -5,9 +5,11 @@
 //! running the project's coverage tool to generate one (auto-collection; disable
 //! with `CSP_NO_AUTORUN`). It then pushes per-file `csp/publishCoverage` (plus
 //! `csp/publishQualityDiagnostics` for uncovered lines and a
-//! `csp/runStateChanged` envelope). Thereafter it answers pull queries and
-//! re-pushes coverage marked `stale` when a document changes. The client cannot
-//! drive runs (`runControl` is `false`); the server owns collection.
+//! `csp/runStateChanged` envelope). Thereafter it answers pull queries, re-pushes
+//! coverage marked `stale` when a document changes (a hint that it may be out of
+//! date — the run is not redone), and re-collects on an explicit `csp/run` from
+//! the client (force, bypassing the freshness fast-path). The server owns
+//! collection; `csp/run` is the only run control in v1 (whole-workspace).
 //!
 //! The [`Server`] is generic over its output writer so it can be driven with an
 //! in-memory buffer in tests; `main.rs` wires it to stdio.
@@ -15,16 +17,54 @@
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use csp_core::base::{Diagnostic, DiagnosticSeverity, Range};
 use csp_core::capabilities::{InitializeParams, InitializeResult};
 use csp_core::coverage::{FileCoverage, RunId};
 use csp_core::jsonrpc::{self, Id, JsonRpcVersion, Request, Response, ResponseError};
 use csp_core::messages::{method, *};
-use csp_core::testing::RunState;
+use csp_core::testing::{RunState, TestResult};
+use std::collections::VecDeque;
 use csp_adapters::{CoverageAdapter, RunData};
 use serde::Serialize;
 use serde_json::Value;
+
+/// What a run does: a full whole-workspace collection, or a fast selective
+/// tests-only run filtered by name.
+pub enum RunKind {
+    Full { force: bool },
+    Selective { filter: Vec<String> },
+}
+
+/// A unit of slow work handed to a worker thread: run the adapter off the main
+/// message loop so the server keeps answering queries while tests run.
+pub struct RunRequest {
+    pub run_id: RunId,
+    pub kind: RunKind,
+    pub root: PathBuf,
+    pub adapter: Arc<dyn CoverageAdapter>,
+}
+
+/// The result of a [`RunRequest`], fed back to [`Server::apply_run_result`].
+pub enum RunOutcome {
+    Full(anyhow::Result<RunData>),
+    Selective(anyhow::Result<Vec<TestResult>>),
+}
+
+impl RunRequest {
+    /// Perform the (blocking) work on a worker thread.
+    pub fn run(&self) -> RunOutcome {
+        match &self.kind {
+            RunKind::Full { force } => {
+                RunOutcome::Full(self.adapter.collect(&self.root, &self.run_id, *force))
+            }
+            RunKind::Selective { filter } => {
+                RunOutcome::Selective(self.adapter.run_tests(&self.root, filter))
+            }
+        }
+    }
+}
 
 /// Outcome of handling one inbound message.
 #[derive(PartialEq, Eq)]
@@ -39,13 +79,22 @@ pub struct Server<W: Write> {
     out: W,
     root: PathBuf,
     framework_hint: Option<String>,
-    adapter: Option<Box<dyn CoverageAdapter>>,
+    adapter: Option<Arc<dyn CoverageAdapter>>,
     /// Latest analysis, keyed by document URI.
     coverage: HashMap<String, FileCoverage>,
     /// Open documents and the version the client last reported.
     open_versions: HashMap<String, i32>,
     run_counter: u64,
     initialized: bool,
+    /// Runs ready to spawn now (at most one — the event loop drains and spawns).
+    pending_runs: Vec<RunRequest>,
+    /// Runs waiting because one is already in flight (serialized; one cargo at a
+    /// time). Full-run requests coalesce so the queue can't bloat.
+    queue: VecDeque<RunRequest>,
+    /// A run is currently being computed on a worker (single-flight).
+    in_flight: bool,
+    /// Whether the in-flight run is a full run (for full-run coalescing).
+    in_flight_is_full: bool,
 }
 
 impl<W: Write> Server<W> {
@@ -59,7 +108,16 @@ impl<W: Write> Server<W> {
             open_versions: HashMap::new(),
             run_counter: 0,
             initialized: false,
+            pending_runs: Vec::new(),
+            queue: VecDeque::new(),
+            in_flight: false,
+            in_flight_is_full: false,
         }
+    }
+
+    /// Drain the runs queued for worker threads (called by the event loop).
+    pub fn take_pending_runs(&mut self) -> Vec<RunRequest> {
+        std::mem::take(&mut self.pending_runs)
     }
 
     /// Dispatch a single request/notification.
@@ -68,13 +126,21 @@ impl<W: Write> Server<W> {
             method::INITIALIZE => self.on_initialize(req),
             method::INITIALIZED => {
                 self.initialized = true;
-                self.run_analysis(false);
+                self.request_run(RunKind::Full { force: false });
                 Flow::Continue
             }
-            // Explicit "run tests" from the client: re-run, forcing fresh
-            // collection (bypass the freshness fast-path).
+            // Explicit "run tests" from the client. No filter → a fresh full run
+            // (force, bypassing freshness). A filter → a fast selective tests-only
+            // run that updates just those results (coverage untouched).
             method::RUN => {
-                self.run_analysis(true);
+                let filter = parse_params::<RunParams>(&req)
+                    .map(|p| p.filter)
+                    .unwrap_or_default();
+                if filter.is_empty() {
+                    self.request_run(RunKind::Full { force: true });
+                } else {
+                    self.request_run(RunKind::Selective { filter });
+                }
                 Flow::Continue
             }
             method::SHUTDOWN => {
@@ -124,7 +190,7 @@ impl<W: Write> Server<W> {
             self.root = uri;
         }
         let hint = params.framework.or_else(|| self.framework_hint.clone());
-        self.adapter = csp_adapters::select(&self.root, hint.as_deref());
+        self.adapter = csp_adapters::select(&self.root, hint.as_deref()).map(Arc::from);
 
         let capabilities = self
             .adapter
@@ -212,81 +278,147 @@ impl<W: Write> Server<W> {
 
     // --- analysis + pushes ---
 
-    /// Run the selected adapter and push everything it produced. `force`
-    /// bypasses the freshness fast-path (an explicit "run tests" request).
-    fn run_analysis(&mut self, force: bool) {
-        // Take the adapter out so we can call `&mut self` push helpers while using
-        // it; it is restored before returning.
-        let Some(adapter) = self.adapter.take() else {
+    /// Enqueue a run (non-blocking) and start it if nothing is in flight. Full
+    /// runs coalesce — a second full request while one is queued/running is
+    /// dropped — so rapid clicks don't pile up redundant whole-workspace runs.
+    fn request_run(&mut self, kind: RunKind) {
+        if self.adapter.is_none() {
+            return;
+        }
+        if matches!(kind, RunKind::Full { .. }) && self.has_pending_full() {
+            return; // coalesce duplicate full runs
+        }
+        self.queue.push_back(RunRequest {
+            run_id: String::new(), // assigned when the run actually starts
+            kind,
+            root: self.root.clone(),
+            adapter: self.adapter.clone().expect("checked above"),
+        });
+        self.start_next();
+    }
+
+    /// True if a full run is already in flight or waiting.
+    fn has_pending_full(&self) -> bool {
+        (self.in_flight && self.in_flight_is_full)
+            || self.queue.iter().any(|r| matches!(r.kind, RunKind::Full { .. }))
+    }
+
+    /// If idle, pop the next queued run, assign its id, emit `running` (full runs
+    /// only — selective runs don't clear the client's view), and hand it to the
+    /// event loop to spawn on a worker.
+    fn start_next(&mut self) {
+        if self.in_flight || !self.pending_runs.is_empty() {
+            return;
+        }
+        let Some(mut req) = self.queue.pop_front() else {
             return;
         };
         self.run_counter += 1;
-        let run_id: RunId = format!("run-{}", self.run_counter);
+        req.run_id = format!("run-{}", self.run_counter);
+        self.in_flight = true;
+        self.in_flight_is_full = matches!(req.kind, RunKind::Full { .. });
+        if self.in_flight_is_full {
+            self.notify(
+                method::RUN_STATE_CHANGED,
+                &RunStateChangedParams {
+                    run_id: req.run_id.clone(),
+                    state: RunState::Running,
+                    message: None,
+                    summary: None,
+                },
+            );
+        }
+        self.pending_runs.push(req);
+    }
 
-        self.notify(
-            method::RUN_STATE_CHANGED,
-            &RunStateChangedParams {
-                run_id: run_id.clone(),
-                state: RunState::Running,
-                message: None,
-                summary: None,
-            },
-        );
+    /// Apply a worker's outcome, then start the next queued run.
+    pub fn apply_run_result(&mut self, run_id: RunId, outcome: RunOutcome) {
+        self.in_flight = false;
+        match outcome {
+            RunOutcome::Full(result) => self.apply_full(run_id, result),
+            RunOutcome::Selective(result) => self.apply_selective(run_id, result),
+        }
+        self.start_next();
+    }
 
-        let data = match adapter.collect(&self.root, &run_id, force) {
-            Ok(d) => d,
+    fn apply_full(&mut self, run_id: RunId, result: anyhow::Result<RunData>) {
+        match result {
             Err(e) => {
                 let reason = format!("{e:#}");
+                eprintln!("[csp-server] analysis failed: {reason}");
                 self.notify(
                     method::RUN_STATE_CHANGED,
                     &RunStateChangedParams {
                         run_id,
                         state: RunState::Errored,
-                        message: Some(reason.clone()),
+                        message: Some(reason),
                         summary: None,
                     },
                 );
-                eprintln!("[csp-server] analysis failed: {reason}");
-                self.adapter = Some(adapter);
-                return;
             }
-        };
-
-        let RunData {
-            coverage,
-            summary,
-            results,
-            ..
-        } = data;
-        for mut file in coverage {
-            // Stamp the version if the file is open, so staleness works later.
-            file.version = self.open_versions.get(&file.uri).copied();
-            self.coverage.insert(file.uri.clone(), file.clone());
-            self.push_coverage(&file);
-            self.push_quality_diagnostics(&file);
+            Ok(RunData {
+                coverage,
+                summary,
+                results,
+                ..
+            }) => {
+                for mut file in coverage {
+                    file.version = self.open_versions.get(&file.uri).copied();
+                    self.coverage.insert(file.uri.clone(), file.clone());
+                    self.push_coverage(&file);
+                    self.push_quality_diagnostics(&file);
+                }
+                if !results.is_empty() {
+                    self.push_test_results(run_id.clone(), results, false);
+                }
+                self.notify(
+                    method::RUN_STATE_CHANGED,
+                    &RunStateChangedParams {
+                        run_id,
+                        state: RunState::Finished,
+                        message: None,
+                        summary: Some(summary),
+                    },
+                );
+            }
         }
+    }
 
-        // Push test pass/fail/skip outcomes, if the adapter produced any.
-        if !results.is_empty() {
-            self.notify(
-                method::PUBLISH_TEST_RESULTS,
-                &PublishTestResultsParams {
-                    run_id: run_id.clone(),
-                    results,
-                },
-            );
+    fn apply_selective(&mut self, run_id: RunId, result: anyhow::Result<Vec<TestResult>>) {
+        match result {
+            Err(e) => eprintln!("[csp-server] selective run failed: {e:#}"),
+            Ok(results) => {
+                if !results.is_empty() {
+                    // Partial: the client merges these into its existing set; no
+                    // coverage and no run-state, so the gutter/summary are intact.
+                    self.push_test_results(run_id, results, true);
+                }
+            }
         }
+    }
 
+    fn push_test_results(&mut self, run_id: RunId, mut results: Vec<TestResult>, partial: bool) {
+        for r in &mut results {
+            r.run_id = run_id.clone();
+        }
         self.notify(
-            method::RUN_STATE_CHANGED,
-            &RunStateChangedParams {
+            method::PUBLISH_TEST_RESULTS,
+            &PublishTestResultsParams {
                 run_id,
-                state: RunState::Finished,
-                message: None,
-                summary: Some(summary),
+                results,
+                partial,
             },
         );
-        self.adapter = Some(adapter);
+    }
+
+    /// Test/synchronous driver: run queued requests inline (on this thread) until
+    /// none remain. Production uses worker threads via
+    /// [`take_pending_runs`](Self::take_pending_runs) + [`apply_run_result`].
+    pub fn run_pending_sync(&mut self) {
+        while let Some(req) = self.pending_runs.pop() {
+            let outcome = req.run();
+            self.apply_run_result(req.run_id, outcome);
+        }
     }
 
     fn push_coverage(&mut self, file: &FileCoverage) {
@@ -480,7 +612,7 @@ mod tests {
         let msgs = drain(&buf);
         let caps = &msgs[0]["result"]["capabilities"];
         assert_eq!(caps["coverage"]["line"], true);
-        assert_eq!(caps["runControl"], false);
+        assert_eq!(caps["runControl"], true); // server implements csp/run
         assert_eq!(msgs[0]["id"], 1);
     }
 
@@ -492,6 +624,7 @@ mod tests {
             let mut server = Server::new(&mut buf, root, None);
             server.handle(req(1, method::INITIALIZE, Value::Null));
             server.handle(notif(method::INITIALIZED, Value::Null));
+            server.run_pending_sync();
         }
         let msgs = drain(&buf);
         let methods: Vec<&str> = msgs.iter().filter_map(|m| m["method"].as_str()).collect();
@@ -526,6 +659,7 @@ mod tests {
             let mut server = Server::new(&mut buf, root, None);
             server.handle(req(1, method::INITIALIZE, Value::Null));
             server.handle(notif(method::INITIALIZED, Value::Null));
+            server.run_pending_sync();
 
             let uri = server.coverage.keys().next().cloned().unwrap();
             server.handle(notif(
@@ -568,7 +702,9 @@ mod tests {
             let mut server = Server::new(&mut buf, root, None);
             server.handle(req(1, method::INITIALIZE, Value::Null));
             server.handle(notif(method::INITIALIZED, Value::Null));
+            server.run_pending_sync(); // initial run completes
             server.handle(req(2, method::RUN, Value::Null));
+            server.run_pending_sync(); // explicit re-run completes
         }
         // The explicit run produces a second batch of coverage + run-state pushes.
         let msgs = drain(&buf);
@@ -580,6 +716,49 @@ mod tests {
     }
 
     #[test]
+    fn run_with_filter_queues_a_selective_run() {
+        let root = temp_lcov_workspace("selective");
+        let mut buf = Vec::new();
+        let mut server = Server::new(&mut buf, root, None);
+        server.handle(req(1, method::INITIALIZE, Value::Null));
+        server.handle(notif(method::INITIALIZED, Value::Null));
+        server.run_pending_sync(); // full run done; server idle
+
+        server.handle(req(2, method::RUN, serde_json::json!({ "filter": ["adds"] })));
+        // A filtered run is selective (would `cargo test adds`), not a full run.
+        assert_eq!(server.pending_runs.len(), 1);
+        assert!(matches!(
+            server.pending_runs[0].kind,
+            RunKind::Selective { .. }
+        ));
+    }
+
+    #[test]
+    fn queries_answered_while_run_in_flight() {
+        // After `initialized` the run is queued (in flight) but NOT yet executed
+        // — handling a query must still respond immediately, never block on it.
+        let root = temp_lcov_workspace("nonblock");
+        let mut buf = Vec::new();
+        {
+            let mut server = Server::new(&mut buf, root, None);
+            server.handle(req(1, method::INITIALIZE, Value::Null));
+            server.handle(notif(method::INITIALIZED, Value::Null));
+            // A run is now in flight (not run_pending_sync'd). Query anyway:
+            assert!(server.in_flight, "run should be in flight");
+            server.handle(req(2, method::SUMMARY, Value::Null));
+            // Coalescing: a second full run while one is in flight is dropped.
+            server.handle(req(3, method::RUN, Value::Null));
+            assert_eq!(server.pending_runs.len(), 1, "single-flight: one run");
+            assert!(server.queue.is_empty(), "duplicate full run coalesced away");
+        }
+        let msgs = drain(&buf);
+        assert!(
+            msgs.iter().any(|m| m["id"] == 2 && m["result"].is_object()),
+            "summary query answered while the run was in flight",
+        );
+    }
+
+    #[test]
     fn coverage_query_returns_cached_data() {
         let root = temp_lcov_workspace("query");
         let mut buf = Vec::new();
@@ -587,6 +766,7 @@ mod tests {
             let mut server = Server::new(&mut buf, root, None);
             server.handle(req(1, method::INITIALIZE, Value::Null));
             server.handle(notif(method::INITIALIZED, Value::Null));
+            server.run_pending_sync();
             let uri = server.coverage.keys().next().cloned().unwrap();
             server.handle(req(2, method::COVERAGE, serde_json::json!({ "uri": uri })));
         }

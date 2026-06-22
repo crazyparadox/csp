@@ -12,12 +12,132 @@
 //! every line in `[startLine, endLine]` with that block's count, taking the max
 //! when blocks overlap a line.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
+use csp_core::base::{Location, Range};
 use csp_core::coverage::{CoverageSummary, FileCoverage, LineCoverage, RunId};
+use csp_core::testing::{TestResult, TestStatus};
+use serde::Deserialize;
 
+use crate::adapters::is_ignored_dir;
 use crate::path_to_uri;
+
+/// One event from `go test -json`. Only the fields we use are deserialized.
+#[derive(Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct GoTestEvent {
+    action: String,
+    #[serde(default)]
+    test: Option<String>,
+    #[serde(default)]
+    output: Option<String>,
+}
+
+/// Parse the `go test -json` event stream into [`TestResult`]s, attaching source
+/// locations (scanned `func TestXxx`) and failure output messages.
+pub fn parse_test_json(stdout: &str, root: &Path) -> Vec<TestResult> {
+    // test name -> (status, accumulated output)
+    let mut acc: BTreeMap<String, (Option<TestStatus>, String)> = BTreeMap::new();
+    for line in stdout.lines() {
+        let Ok(ev) = serde_json::from_str::<GoTestEvent>(line.trim()) else {
+            continue;
+        };
+        let Some(test) = ev.test.clone() else {
+            continue; // package-level event
+        };
+        let entry = acc.entry(test).or_insert((None, String::new()));
+        match ev.action.as_str() {
+            "pass" => entry.0 = Some(TestStatus::Pass),
+            "fail" => entry.0 = Some(TestStatus::Fail),
+            "skip" => entry.0 = Some(TestStatus::Skip),
+            "output" => {
+                if let Some(o) = ev.output {
+                    // Drop libtest-style framing noise; keep assertion output.
+                    let t = o.trim_end();
+                    if !t.trim_start().starts_with("=== ")
+                        && !t.trim_start().starts_with("--- ")
+                        && !t.trim().is_empty()
+                    {
+                        entry.1.push_str(t);
+                        entry.1.push('\n');
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let locations = go_test_locations(root);
+    acc.into_iter()
+        .filter_map(|(name, (status, output))| {
+            let status = status?;
+            // Subtests ("TestAdd/case") share the parent func's location.
+            let top = name.split('/').next().unwrap_or(&name);
+            let location = locations.get(top).map(|(rel, line)| Location {
+                uri: path_to_uri(root, rel),
+                range: Range::whole_line(*line),
+            });
+            let message = (status == TestStatus::Fail && !output.trim().is_empty())
+                .then(|| output.trim().to_string());
+            Some(TestResult {
+                id: name.clone(),
+                name,
+                status,
+                run_id: String::new(),
+                message,
+                location,
+                duration_ms: None,
+            })
+        })
+        .collect()
+}
+
+/// Map each `func TestXxx`/`func BenchmarkXxx` to its source file + 0-based line.
+fn go_test_locations(root: &Path) -> HashMap<String, (String, u32)> {
+    fn walk(dir: &Path, root: &Path, map: &mut HashMap<String, (String, u32)>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(ft) = entry.file_type() else { continue };
+            if ft.is_dir() {
+                if !is_ignored_dir(&path) {
+                    walk(&path, root, map);
+                }
+            } else if path.extension().map(|e| e == "go").unwrap_or(false) {
+                let Ok(content) = std::fs::read_to_string(&path) else {
+                    continue;
+                };
+                let rel = path
+                    .strip_prefix(root)
+                    .unwrap_or(&path)
+                    .to_string_lossy()
+                    .into_owned();
+                for (i, line) in content.lines().enumerate() {
+                    if let Some(name) = parse_go_test_fn(line.trim_start()) {
+                        map.entry(name).or_insert((rel.clone(), i as u32));
+                    }
+                }
+            }
+        }
+    }
+    let mut map = HashMap::new();
+    walk(root, root, &mut map);
+    map
+}
+
+/// Extract `Foo` from `func TestFoo(t *testing.T) {` (and Benchmark/Fuzz).
+fn parse_go_test_fn(line: &str) -> Option<String> {
+    let rest = line.strip_prefix("func ")?;
+    let name: String = rest
+        .chars()
+        .take_while(|c| c.is_alphanumeric() || *c == '_')
+        .collect();
+    (name.starts_with("Test") || name.starts_with("Benchmark") || name.starts_with("Fuzz"))
+        .then_some(name)
+}
 
 /// Parse a Go coverage profile into one [`FileCoverage`] per source file.
 pub fn parse(content: &str, root: &Path, run_id: &RunId) -> Vec<FileCoverage> {
@@ -114,6 +234,31 @@ fn go_path_to_uri(root: &Path, go_path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_go_test_json() {
+        let stdout = concat!(
+            r#"{"Action":"run","Test":"TestAdd"}"#,
+            "\n",
+            r#"{"Action":"pass","Test":"TestAdd"}"#,
+            "\n",
+            r#"{"Action":"output","Test":"TestFails","Output":"    math_test.go:10: want 5 got 9\n"}"#,
+            "\n",
+            r#"{"Action":"fail","Test":"TestFails"}"#,
+            "\n",
+            r#"{"Action":"skip","Test":"TestSkipped"}"#,
+            "\n",
+            r#"{"Action":"pass","Package":"p"}"#,
+        );
+        let results = parse_test_json(stdout, Path::new("/nonexistent"));
+        assert_eq!(results.len(), 3, "package-level event excluded");
+        let by = |s: TestStatus| results.iter().filter(|r| r.status == s).count();
+        assert_eq!(by(TestStatus::Pass), 1);
+        assert_eq!(by(TestStatus::Fail), 1);
+        assert_eq!(by(TestStatus::Skip), 1);
+        let fails = results.iter().find(|r| r.name == "TestFails").unwrap();
+        assert!(fails.message.as_ref().unwrap().contains("want 5 got 9"));
+    }
 
     #[test]
     fn expands_blocks_to_lines_with_max_count() {

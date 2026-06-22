@@ -4,10 +4,12 @@
 //! [`CoverageAdapter`] knows how to (a) recognise a workspace it applies to and
 //! (b) parse that workspace's coverage artifact into [`RunData`].
 //!
-//! CSP v1 is report-only, so adapters **read existing artifacts** (an `lcov.info`,
-//! a `coverage.out`, an Istanbul `coverage-final.json`) rather than running tests.
-//! The protocol never mentions these formats; that translation is exactly the job
-//! this crate factors out.
+//! Adapters reuse an existing artifact (an `lcov.info`, a `coverage.out`, an
+//! Istanbul `coverage-final.json`) when one is present and fresh, and otherwise
+//! **run the project's coverage tool** to produce one (`generate`). The Rust
+//! adapter additionally parses pass/fail results and failure messages from the
+//! test run. The protocol never mentions these formats; that translation is
+//! exactly the job this crate factors out.
 
 use std::path::{Path, PathBuf};
 
@@ -79,6 +81,15 @@ pub trait CoverageAdapter: Send + Sync {
     /// [`generate`](Self::generate) before parsing. Returns an error if no
     /// artifact can be obtained or it is malformed.
     fn collect(&self, root: &Path, run_id: &RunId, force: bool) -> anyhow::Result<RunData>;
+
+    /// Run only the tests matching `filter` (libtest-style substrings), fast and
+    /// **without** instrumentation — a selective re-run that updates just those
+    /// results and leaves coverage untouched. The default returns empty (adapters
+    /// that can't selectively run tests). Results carry no `run_id` (the server
+    /// stamps it).
+    fn run_tests(&self, _root: &Path, _filter: &[String]) -> anyhow::Result<Vec<TestResult>> {
+        Ok(Vec::new())
+    }
 }
 
 /// The built-in adapters, in detection-priority order (most specific first, the

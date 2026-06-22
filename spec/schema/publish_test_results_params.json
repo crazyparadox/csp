@@ -8,6 +8,11 @@
     "runId"
   ],
   "properties": {
+    "partial": {
+      "description": "True when this is a **selective** run covering only a subset of tests (e.g. re-running failures). The client merges these into existing results rather than replacing the whole set.",
+      "default": false,
+      "type": "boolean"
+    },
     "results": {
       "type": "array",
       "items": {

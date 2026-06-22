@@ -127,10 +127,14 @@ fn parse_fn_name(line: &str) -> Option<String> {
     (!name.is_empty()).then_some(name)
 }
 
-/// Where the Rust adapter stashes parsed test results between runs. Lives under
-/// `target/` (ignored by the freshness walk and the artifact search) so it is
-/// reused on the fast path without ever making coverage look stale.
-const TEST_RESULTS_SIDECAR: &str = "target/.csp-test-results.json";
+/// Adapters stash parsed test results in a sidecar between runs so they survive
+/// the freshness fast-path (when coverage is reused without re-running). The
+/// basename is skipped by the freshness walk; each adapter picks a directory
+/// already excluded from it (or root, since the basename is excluded).
+const SIDECAR_NAME: &str = ".csp-test-results.json";
+const RUST_SIDECAR: &str = "target/.csp-test-results.json";
+const GO_SIDECAR: &str = ".csp-test-results.json";
+const TS_SIDECAR: &str = "coverage/.csp-test-results.json";
 
 /// Parse libtest's human-readable output (the lines cargo-llvm-cov prints while
 /// running the suite) into [`TestResult`]s. Each test prints
@@ -166,9 +170,143 @@ fn parse_cargo_test_output(stdout: &str, run_id: &RunId) -> Vec<TestResult> {
     out
 }
 
-/// Read the test-results sidecar (if present), stamping the current `run_id`.
-fn read_test_results(root: &Path, run_id: &RunId) -> Vec<TestResult> {
-    let Ok(bytes) = std::fs::read(root.join(TEST_RESULTS_SIDECAR)) else {
+/// Parse a test run's stdout into fully-annotated [`TestResult`]s: status lines,
+/// source locations (`#[test]` scan), and — for failures — the panic/assertion
+/// message and the precise failing line.
+fn parse_test_run(stdout: &str, root: &Path) -> Vec<TestResult> {
+    let mut results = parse_cargo_test_output(stdout, &String::new());
+    attach_test_locations(&mut results, root);
+    attach_failure_details(&mut results, stdout, root);
+    results
+}
+
+/// For each failing test, attach the captured panic/assertion text as its
+/// `message`, and (when resolvable) refine its `location` to the exact panic
+/// line — more precise than the test-fn line.
+fn attach_failure_details(results: &mut [TestResult], stdout: &str, root: &Path) {
+    let details = parse_failure_blocks(stdout);
+    for r in results.iter_mut() {
+        if r.status != TestStatus::Fail {
+            continue;
+        }
+        if let Some((message, panic_loc)) = details.get(&r.name) {
+            r.message = Some(message.clone());
+            // Prefer the exact panic location when it resolves to a real file.
+            if let Some((file, line)) = panic_loc {
+                if root.join(file).exists() {
+                    r.location = Some(Location {
+                        uri: path_to_uri(root, file),
+                        range: Range::whole_line(*line),
+                    });
+                }
+            }
+        }
+    }
+}
+
+/// Extract per-test failure blocks from libtest's `failures:` output:
+/// `---- <name> stdout ----` … capturing the message and `panicked at file:line:col`.
+fn parse_failure_blocks(stdout: &str) -> HashMap<String, (String, Option<(String, u32)>)> {
+    let mut out = HashMap::new();
+    let lines: Vec<&str> = stdout.lines().collect();
+    let mut i = 0;
+    while i < lines.len() {
+        let line = lines[i].trim();
+        if let Some(name) = line
+            .strip_prefix("---- ")
+            .and_then(|s| s.strip_suffix(" stdout ----"))
+        {
+            // Collect the block until the next `---- ` header, the trailing
+            // `failures:` summary list, or a backtrace note.
+            let mut body = Vec::new();
+            let mut panic_loc = None;
+            i += 1;
+            while i < lines.len() {
+                let l = lines[i];
+                let lt = l.trim();
+                if lt.starts_with("---- ") || lt == "failures:" {
+                    break;
+                }
+                if lt.starts_with("note: run with") {
+                    i += 1;
+                    continue;
+                }
+                // The `thread '…' panicked at file:line:col:` line is noise in the
+                // UI — capture its location, but keep it out of the message so the
+                // user sees just the assertion.
+                if let Some((_, rest)) = lt.split_once("panicked at ") {
+                    if panic_loc.is_none() {
+                        panic_loc = parse_panic_location(rest.trim_end_matches(':'));
+                    }
+                    i += 1;
+                    continue;
+                }
+                if !lt.is_empty() {
+                    body.push(lt.to_string());
+                }
+                i += 1;
+            }
+            if !body.is_empty() {
+                out.insert(name.to_string(), (body.join("\n"), panic_loc));
+            }
+            continue;
+        }
+        i += 1;
+    }
+    out
+}
+
+/// Parse `src/lib.rs:7:9` → (`src/lib.rs`, 0-based line 6).
+fn parse_panic_location(s: &str) -> Option<(String, u32)> {
+    let mut it = s.rsplitn(3, ':');
+    let _col = it.next()?;
+    let line: u32 = it.next()?.parse().ok()?;
+    let file = it.next()?;
+    Some((file.to_string(), line.saturating_sub(1)))
+}
+
+/// Run `cargo test` (no instrumentation — fast) with `extra_args` (e.g. `-p pkg`)
+/// and `filter` test-name substrings, returning the parsed results. Tolerates a
+/// non-zero exit (failing tests still print their results).
+fn run_cargo_tests(
+    root: &Path,
+    extra_args: &[String],
+    filter: &[String],
+) -> anyhow::Result<Vec<TestResult>> {
+    let mut cmd = Command::new("cargo");
+    cmd.arg("test").args(extra_args).arg("--no-fail-fast");
+    for f in filter {
+        cmd.arg(f);
+    }
+    let output = cmd
+        .current_dir(root)
+        .output()
+        .context("could not run `cargo test` (is cargo on PATH?)")?;
+    Ok(parse_test_run(&String::from_utf8_lossy(&output.stdout), root))
+}
+
+/// Extract `-p <pkg>` / `--package <pkg>` pairs from a configured command so a
+/// selective `cargo test` can be scoped to the same package(s).
+fn package_args(command: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut it = command.iter();
+    while let Some(a) = it.next() {
+        if a == "-p" || a == "--package" {
+            if let Some(pkg) = it.next() {
+                out.push("-p".to_string());
+                out.push(pkg.clone());
+            }
+        } else if let Some(pkg) = a.strip_prefix("--package=") {
+            out.push("-p".to_string());
+            out.push(pkg.to_string());
+        }
+    }
+    out
+}
+
+/// Read a results sidecar (if present), stamping the current `run_id`.
+fn read_test_results(root: &Path, rel: &str, run_id: &RunId) -> Vec<TestResult> {
+    let Ok(bytes) = std::fs::read(root.join(rel)) else {
         return Vec::new();
     };
     let Ok(mut results) = serde_json::from_slice::<Vec<TestResult>>(&bytes) else {
@@ -178,6 +316,20 @@ fn read_test_results(root: &Path, run_id: &RunId) -> Vec<TestResult> {
         r.run_id = run_id.clone();
     }
     results
+}
+
+/// Write parsed results to a sidecar (best-effort), creating its directory.
+fn write_test_results(root: &Path, rel: &str, results: &[TestResult]) {
+    if results.is_empty() {
+        return;
+    }
+    let path = root.join(rel);
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if let Ok(json) = serde_json::to_vec(results) {
+        let _ = std::fs::write(path, json);
+    }
 }
 
 /// Whether the server may run the project's coverage tool to generate a missing
@@ -201,25 +353,6 @@ fn tool_available(program: &str, probe_args: &[&str]) -> bool {
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)
-}
-
-/// Run a coverage tool in `root`, returning a helpful error if it is not
-/// installed or exits non-zero.
-fn run_tool(root: &Path, program: &str, args: &[&str]) -> anyhow::Result<()> {
-    let output = Command::new(program)
-        .args(args)
-        .current_dir(root)
-        .output()
-        .with_context(|| format!("could not run `{program}` (is it installed and on PATH?)"))?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!(
-            "`{program} {}` failed: {}",
-            args.join(" "),
-            stderr.trim()
-        );
-    }
-    Ok(())
 }
 
 /// Ensure the `cargo llvm-cov` subcommand is available, installing it (and its
@@ -351,7 +484,8 @@ fn full_caps() -> ServerCapabilities {
         test_results: false,
         test_mapping: false,
         quality_diagnostics: true,
-        run_control: false,
+        // The server implements `csp/run` (force a fresh whole-workspace run).
+        run_control: true,
     }
 }
 
@@ -442,7 +576,10 @@ fn newest_source_mtime(root: &Path, artifact: &Path) -> Option<std::time::System
                 if !is_ignored_dir(&path) {
                     walk(&path, artifact, newest);
                 }
-            } else if file_type.is_file() && path != artifact {
+            } else if file_type.is_file()
+                && path != artifact
+                && path.file_name().and_then(|n| n.to_str()) != Some(SIDECAR_NAME)
+            {
                 if let Ok(m) = entry.metadata().and_then(|md| md.modified()) {
                     if newest.is_none_or(|n| m > n) {
                         *newest = Some(m);
@@ -458,7 +595,7 @@ fn newest_source_mtime(root: &Path, artifact: &Path) -> Option<std::time::System
 
 /// Directories that never count as sources for freshness (build outputs, deps,
 /// VCS, coverage reports).
-fn is_ignored_dir(path: &Path) -> bool {
+pub(crate) fn is_ignored_dir(path: &Path) -> bool {
     matches!(
         path.file_name().and_then(|n| n.to_str()),
         Some(
@@ -549,14 +686,8 @@ impl CoverageAdapter for RustAdapter {
         // Stash parsed test results alongside coverage so `collect` can surface
         // them (and reuse them on the freshness fast path). run_id is stamped at
         // read time, so store with an empty placeholder.
-        let results = parse_cargo_test_output(&String::from_utf8_lossy(&output.stdout), &String::new());
-        let mut results = results;
-        attach_test_locations(&mut results, root);
-        if !results.is_empty() {
-            if let Ok(json) = serde_json::to_vec(&results) {
-                let _ = std::fs::write(root.join(TEST_RESULTS_SIDECAR), json);
-            }
-        }
+        let results = parse_test_run(&String::from_utf8_lossy(&output.stdout), root);
+        write_test_results(root, RUST_SIDECAR, &results);
         Ok(())
     }
 
@@ -565,8 +696,12 @@ impl CoverageAdapter for RustAdapter {
         let content = std::fs::read_to_string(&path)
             .with_context(|| format!("reading {}", path.display()))?;
         let mut data = RunData::from_coverage(run_id.clone(), lcov::parse(&content, root, run_id));
-        data.results = read_test_results(root, run_id);
+        data.results = read_test_results(root, RUST_SIDECAR, run_id);
         Ok(data)
+    }
+
+    fn run_tests(&self, root: &Path, filter: &[String]) -> anyhow::Result<Vec<TestResult>> {
+        run_cargo_tests(root, &[], filter)
     }
 }
 
@@ -596,17 +731,33 @@ impl CoverageAdapter for GoAdapter {
                 branch: false,
                 function: false,
             },
+            test_results: true,
             quality_diagnostics: true,
+            run_control: true,
             ..ServerCapabilities::default()
         }
     }
 
     fn generate(&self, root: &Path) -> anyhow::Result<()> {
-        run_tool(
-            root,
-            "go",
-            &["test", "-coverprofile=coverage.out", "./..."],
-        )
+        // `-json` emits the test event stream on stdout *and* writes the
+        // coverprofile, so one run yields both coverage and results.
+        let output = Command::new("go")
+            .args(["test", "-json", "-coverprofile=coverage.out", "./..."])
+            .current_dir(root)
+            .output()
+            .context("could not run `go test` (is go on PATH?)")?;
+
+        let results = go::parse_test_json(&String::from_utf8_lossy(&output.stdout), root);
+        write_test_results(root, GO_SIDECAR, &results);
+
+        // `go test` exits non-zero when tests fail but still writes the profile.
+        if Self::find_profile(root).is_none() {
+            anyhow::bail!(
+                "`go test` produced no coverage profile: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        Ok(())
     }
 
     fn collect(&self, root: &Path, run_id: &RunId, force: bool) -> anyhow::Result<RunData> {
@@ -619,10 +770,25 @@ impl CoverageAdapter for GoAdapter {
         )?;
         let content = std::fs::read_to_string(&path)
             .with_context(|| format!("reading {}", path.display()))?;
-        Ok(RunData::from_coverage(
-            run_id.clone(),
-            go::parse(&content, root, run_id),
-        ))
+        let mut data = RunData::from_coverage(run_id.clone(), go::parse(&content, root, run_id));
+        data.results = read_test_results(root, GO_SIDECAR, run_id);
+        Ok(data)
+    }
+
+    fn run_tests(&self, root: &Path, filter: &[String]) -> anyhow::Result<Vec<TestResult>> {
+        // `go test -run '^(A|B)$'` runs only the named tests, fast (no coverage).
+        let mut args = vec!["test".to_string(), "-json".to_string()];
+        if !filter.is_empty() {
+            args.push("-run".to_string());
+            args.push(format!("^({})$", filter.join("|")));
+        }
+        args.push("./...".to_string());
+        let output = Command::new("go")
+            .args(&args)
+            .current_dir(root)
+            .output()
+            .context("could not run `go test`")?;
+        Ok(go::parse_test_json(&String::from_utf8_lossy(&output.stdout), root))
     }
 }
 
@@ -653,24 +819,67 @@ impl CoverageAdapter for TsAdapter {
     }
 
     fn capabilities(&self) -> ServerCapabilities {
-        full_caps()
+        ServerCapabilities {
+            test_results: true,
+            ..full_caps()
+        }
     }
 
     fn generate(&self, root: &Path) -> anyhow::Result<()> {
-        // Vitest with the Istanbul provider + json reporter writes
-        // coverage/coverage-final.json, which `find_istanbul` then locates.
-        run_tool(
-            root,
-            "npx",
-            &[
+        // Vitest writes coverage/coverage-final.json (Istanbul) and, via the json
+        // test reporter, the per-test results to a file we then parse.
+        let report = "coverage/.csp-vitest.json";
+        let output = Command::new("npx")
+            .args([
                 "--no-install",
                 "vitest",
                 "run",
                 "--coverage",
                 "--coverage.provider=istanbul",
                 "--coverage.reporter=json",
-            ],
-        )
+                "--reporter=json",
+                "--outputFile",
+                report,
+            ])
+            .current_dir(root)
+            .output()
+            .context("could not run `vitest` (is it installed in the project?)")?;
+
+        if let Ok(json) = std::fs::read_to_string(root.join(report)) {
+            let results = istanbul::parse_vitest_json(&json, root);
+            write_test_results(root, TS_SIDECAR, &results);
+        }
+
+        if Self::find_istanbul(root).is_none() {
+            anyhow::bail!(
+                "`vitest` produced no coverage: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        Ok(())
+    }
+
+    fn run_tests(&self, root: &Path, filter: &[String]) -> anyhow::Result<Vec<TestResult>> {
+        let report = "coverage/.csp-vitest-sel.json";
+        // Vitest filters by test name with `-t <pattern>` (a regex over the full
+        // test name); join the requested names into one alternation.
+        let pattern = filter.join("|");
+        let _ = Command::new("npx")
+            .args([
+                "--no-install",
+                "vitest",
+                "run",
+                "--reporter=json",
+                "--outputFile",
+                report,
+                "-t",
+                &pattern,
+            ])
+            .current_dir(root)
+            .output()
+            .context("could not run `vitest`")?;
+        let json = std::fs::read_to_string(root.join(report)).unwrap_or_default();
+        Ok(istanbul::parse_vitest_json(&json, root))
     }
 
     fn collect(&self, root: &Path, run_id: &RunId, force: bool) -> anyhow::Result<RunData> {
@@ -695,7 +904,9 @@ impl CoverageAdapter for TsAdapter {
             .with_context(|| format!("reading {}", path.display()))?;
         let coverage = istanbul::parse(&content, root, run_id)
             .with_context(|| format!("parsing istanbul JSON {}", path.display()))?;
-        Ok(RunData::from_coverage(run_id.clone(), coverage))
+        let mut data = RunData::from_coverage(run_id.clone(), coverage);
+        data.results = read_test_results(root, TS_SIDECAR, run_id);
+        Ok(data)
     }
 }
 
@@ -716,7 +927,9 @@ impl CoverageAdapter for GenericLcovAdapter {
         full_caps()
     }
 
-    fn collect(&self, root: &Path, run_id: &RunId, force: bool) -> anyhow::Result<RunData> {
+    fn collect(&self, root: &Path, run_id: &RunId, _force: bool) -> anyhow::Result<RunData> {
+        // Generic fallback only ever reads a pre-existing LCOV file; nothing to
+        // (re)generate, so `force` is irrelevant here.
         let path = find_lcov(root).context("no LCOV file found")?;
         let content = std::fs::read_to_string(&path)
             .with_context(|| format!("reading {}", path.display()))?;
@@ -792,14 +1005,8 @@ impl CoverageAdapter for ConfiguredAdapter {
             .with_context(|| format!("could not run `{program}` (is it installed and on PATH?)"))?;
 
         // Best-effort test results from libtest-style stdout.
-        let results = parse_cargo_test_output(&String::from_utf8_lossy(&output.stdout), &String::new());
-        let mut results = results;
-        attach_test_locations(&mut results, root);
-        if !results.is_empty() {
-            if let Ok(json) = serde_json::to_vec(&results) {
-                let _ = std::fs::write(root.join(TEST_RESULTS_SIDECAR), json);
-            }
-        }
+        let results = parse_test_run(&String::from_utf8_lossy(&output.stdout), root);
+        write_test_results(root, RUST_SIDECAR, &results);
 
         // Trust the artifact over the exit code (failing tests still emit it).
         if !output.status.success() && !self.artifact_path(root).exists() {
@@ -836,8 +1043,14 @@ impl CoverageAdapter for ConfiguredAdapter {
             .with_context(|| format!("reading {}", artifact.display()))?;
         let coverage = parse_artifact(&content, &self.artifact, root, run_id)?;
         let mut data = RunData::from_coverage(run_id.clone(), coverage);
-        data.results = read_test_results(root, run_id);
+        data.results = read_test_results(root, RUST_SIDECAR, run_id);
         Ok(data)
+    }
+
+    fn run_tests(&self, root: &Path, filter: &[String]) -> anyhow::Result<Vec<TestResult>> {
+        // Scope the selective run to the same package(s) the configured command
+        // targets (e.g. `-p neumann_server`), so it stays fast in a monorepo.
+        run_cargo_tests(root, &package_args(&self.command), filter)
     }
 }
 
@@ -866,6 +1079,38 @@ mod tests {
     fn set_mtime(path: &Path, secs: u64) {
         let f = std::fs::OpenOptions::new().write(true).open(path).unwrap();
         f.set_modified(UNIX_EPOCH + Duration::from_secs(secs)).unwrap();
+    }
+
+    #[test]
+    fn parses_failure_message_and_location() {
+        let stdout = "\
+running 2 tests
+test tests::adds ... ok
+test tests::fails ... FAILED
+
+failures:
+
+---- tests::fails stdout ----
+
+thread 'tests::fails' panicked at src/lib.rs:7:9:
+assertion `left == right` failed
+  left: 5
+ right: 999
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    tests::fails
+
+test result: FAILED. 1 passed; 1 failed; 0 ignored
+";
+        let blocks = parse_failure_blocks(stdout);
+        let (msg, loc) = blocks.get("tests::fails").expect("a failure block");
+        assert!(msg.contains("assertion `left == right` failed"));
+        assert!(msg.contains("left: 5"));
+        assert!(!msg.contains("note: run with"), "backtrace note is dropped");
+        assert!(!msg.contains("panicked at"), "the noisy thread/panic line is dropped");
+        assert_eq!(loc.as_ref().unwrap(), &("src/lib.rs".to_string(), 6)); // 1-based 7 → 0-based 6
     }
 
     #[test]

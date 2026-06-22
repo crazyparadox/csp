@@ -23,12 +23,117 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use csp_core::base::{Position, Range};
+use csp_core::base::Location;
 use csp_core::coverage::{
     BranchCoverage, CoverageSummary, FileCoverage, FunctionCoverage, LineCoverage, RunId,
 };
+use csp_core::testing::{TestResult, TestStatus};
 use serde_json::Value;
 
 use crate::path_to_uri;
+
+/// Parse Vitest's/Jest's JSON test report into [`TestResult`]s. Each file's
+/// `assertionResults` become tests; locations come from the report when present,
+/// else from scanning the file for `test("title")` / `it("title")`.
+pub fn parse_vitest_json(json: &str, root: &Path) -> Vec<TestResult> {
+    let Ok(v) = serde_json::from_str::<Value>(json) else {
+        return Vec::new();
+    };
+    let Some(files) = v.get("testResults").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for file in files {
+        let abs = file.get("name").and_then(Value::as_str).unwrap_or("");
+        let rel = relative_to(root, abs);
+        for a in file
+            .get("assertionResults")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let title = a.get("title").and_then(Value::as_str).unwrap_or("").to_string();
+            let ancestors: Vec<&str> = a
+                .get("ancestorTitles")
+                .and_then(Value::as_array)
+                .map(|x| x.iter().filter_map(Value::as_str).collect())
+                .unwrap_or_default();
+            let name = if ancestors.is_empty() {
+                title.clone()
+            } else {
+                format!("{} › {}", ancestors.join(" › "), title)
+            };
+            let status = match a.get("status").and_then(Value::as_str) {
+                Some("passed") => TestStatus::Pass,
+                Some("failed") => TestStatus::Fail,
+                _ => TestStatus::Skip, // pending / skipped / todo
+            };
+            let message = if status == TestStatus::Fail {
+                a.get("failureMessages")
+                    .and_then(Value::as_array)
+                    .map(|m| {
+                        m.iter()
+                            .filter_map(Value::as_str)
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    })
+                    .filter(|s| !s.trim().is_empty())
+            } else {
+                None
+            };
+            // Location: from the report if present, else scan the file for the title.
+            let line = a
+                .get("location")
+                .and_then(|l| l.get("line"))
+                .and_then(Value::as_u64)
+                .map(|n| (n as u32).saturating_sub(1))
+                .or_else(|| rel.as_deref().and_then(|r| scan_test_line(root, r, &title)));
+            let location = match (&rel, line) {
+                (Some(r), Some(l)) => Some(Location {
+                    uri: path_to_uri(root, r),
+                    range: csp_core::base::Range::whole_line(l),
+                }),
+                _ => None,
+            };
+            out.push(TestResult {
+                id: name.clone(),
+                name,
+                status,
+                run_id: String::new(),
+                message,
+                location,
+                duration_ms: None,
+            });
+        }
+    }
+    out
+}
+
+/// Strip `root` from an absolute path → a root-relative path (or `None`).
+fn relative_to(root: &Path, abs: &str) -> Option<String> {
+    Path::new(abs)
+        .strip_prefix(root)
+        .ok()
+        .map(|p| p.to_string_lossy().into_owned())
+}
+
+/// Find the 0-based line of `test("title")` / `it("title")` in a source file.
+fn scan_test_line(root: &Path, rel: &str, title: &str) -> Option<u32> {
+    let content = std::fs::read_to_string(root.join(rel)).ok()?;
+    let needles = [
+        format!("\"{title}\""),
+        format!("'{title}'"),
+        format!("`{title}`"),
+    ];
+    content.lines().enumerate().find_map(|(i, line)| {
+        let t = line.trim_start();
+        let is_test = t.starts_with("test(")
+            || t.starts_with("it(")
+            || t.starts_with("test.")
+            || t.starts_with("it.");
+        (is_test && needles.iter().any(|n| line.contains(n.as_str()))).then_some(i as u32)
+    })
+}
 
 /// Parse an Istanbul coverage document. Returns an error if the JSON is invalid.
 pub fn parse(content: &str, root: &Path, run_id: &RunId) -> anyhow::Result<Vec<FileCoverage>> {
@@ -146,6 +251,25 @@ fn pos_of(p: &Value) -> Option<Position> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_vitest_json() {
+        let json = r#"{ "testResults": [ {
+            "name": "/proj/src/math.test.ts",
+            "assertionResults": [
+              { "ancestorTitles": [], "title": "add", "status": "passed", "location": { "line": 4, "column": 1 } },
+              { "ancestorTitles": ["math"], "title": "sub", "status": "failed", "failureMessages": ["expected 1 to be 2"] }
+            ]
+        } ] }"#;
+        let results = parse_vitest_json(json, Path::new("/proj"));
+        assert_eq!(results.len(), 2);
+        let add = results.iter().find(|r| r.name == "add").unwrap();
+        assert_eq!(add.status, TestStatus::Pass);
+        assert_eq!(add.location.as_ref().unwrap().range.start.line, 3); // 1-based 4 → 0-based 3
+        let sub = results.iter().find(|r| r.name == "math › sub").unwrap();
+        assert_eq!(sub.status, TestStatus::Fail);
+        assert!(sub.message.as_ref().unwrap().contains("expected 1 to be 2"));
+    }
 
     const SAMPLE: &str = r#"{
       "/proj/src/math.ts": {

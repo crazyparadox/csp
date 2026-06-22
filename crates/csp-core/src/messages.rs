@@ -80,6 +80,21 @@ pub struct PublishCoverageParams {
 pub struct PublishTestResultsParams {
     pub run_id: RunId,
     pub results: Vec<TestResult>,
+    /// True when this is a **selective** run covering only a subset of tests
+    /// (e.g. re-running failures). The client merges these into existing results
+    /// rather than replacing the whole set.
+    #[serde(default)]
+    pub partial: bool,
+}
+
+/// Params of `csp/run`. An empty/absent `filter` is a full whole-workspace run;
+/// a `filter` runs only the named tests (libtest-style substring filters), a fast
+/// tests-only pass that updates just those results — coverage is left untouched.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct RunParams {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub filter: Vec<String>,
 }
 
 /// Params of `csp/publishQualityDiagnostics`. Mirrors LSP `publishDiagnostics`:
